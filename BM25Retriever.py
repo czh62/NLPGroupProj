@@ -4,6 +4,7 @@ import pickle
 from typing import List, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 from HQSmallDataLoader import HQSmallDataLoader
 
@@ -66,8 +67,9 @@ class BM25Retriever:
         self.documents = documents
         self.doc_lengths = []
 
+        print("Building vocabulary...")
         # 第一遍：构建词汇表和文档长度
-        for doc_idx, doc_text in enumerate(documents):
+        for doc_idx, doc_text in enumerate(tqdm(documents, desc="Processing documents")):
             tokens = self._preprocess_text(doc_text)
             self.doc_lengths.append(len(tokens))
 
@@ -79,10 +81,11 @@ class BM25Retriever:
         # 计算平均文档长度
         self.avg_doc_length = np.mean(self.doc_lengths) if self.doc_lengths else 0
 
+        print("Building inverted index...")
         # 第二遍：构建倒排索引
         self.inverted_index = {term: {} for term in self.vocab}
 
-        for doc_idx, doc_text in enumerate(documents):
+        for doc_idx, doc_text in enumerate(tqdm(documents, desc="Building inverted index")):
             tokens = self._preprocess_text(doc_text)
             term_freq = {}
 
@@ -100,7 +103,8 @@ class BM25Retriever:
         """
         total_docs = len(self.documents)
 
-        for term, doc_dict in self.inverted_index.items():
+        print("Computing IDF scores...")
+        for term, doc_dict in tqdm(self.inverted_index.items(), desc="Calculating IDF"):
             doc_freq = len(doc_dict)  # 包含该term的文档数量
             # 使用BM25的IDF公式
             self.idf[term] = np.log((total_docs - doc_freq + 0.5) / (doc_freq + 0.5) + 1)
@@ -234,7 +238,6 @@ def main():
     """
     主函数：演示BM25检索器的使用
     """
-    from tqdm import tqdm
     # 初始化数据加载器
     data_loader = HQSmallDataLoader("./data")
 
@@ -253,6 +256,7 @@ def main():
     else:
         print("Building new index...")
         # 加载文档集合
+        print("Loading document collection...")
         doc_ids, documents = data_loader.load_collection(collection_path)
 
         # 训练BM25模型
@@ -277,6 +281,7 @@ def main():
 
     # 演示批量处理（用于生成测试预测）
     print("\n=== Batch Processing Demo ===")
+    print("Loading training set...")
     test_queries_data = data_loader.load_train_set(train_set_path)
 
     batch_results = []
@@ -293,12 +298,13 @@ def main():
 
     # 保存预测结果（示例）
     output_path = "./data/test_prediction_demo.jsonl"
+    print(f"Saving results to {output_path}...")
     with open(output_path, 'w', encoding='utf-8') as f:
-        for result in tqdm(batch_results, desc="Saving results"):
+        for result in tqdm(batch_results, desc="Writing results"):
             f.write(json.dumps(result) + '\n')
 
     print(f"Demo predictions saved to {output_path}")
 
+
 if __name__ == "__main__":
     main()
-
