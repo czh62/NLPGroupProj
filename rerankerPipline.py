@@ -9,6 +9,7 @@ import test
 from BGEReranker import BGEReranker
 from BM25Retriever import BM25Retriever
 from HQSmallDataLoader import HQSmallDataLoader
+from denseInstructionRetriever import Qwen3Retriever
 from denseRetriever import BGERetriever
 
 
@@ -99,12 +100,14 @@ def main_hybrid():
     # 初始化三个模型
     bm25_retriever = BM25Retriever()
     bge_retriever = BGERetriever()
+    qwen3_retriever = Qwen3Retriever()
     reranker = BGEReranker(api_key=test.API_KEY)  # 第一次运行会自动下载模型
 
     # 加载索引 (假设你已经按照之前的脚本生成了索引)
     print("Loading indices...")
     bm25_retriever.load_index(config.BM25_INDEX_PATH)
     bge_retriever.load_index(config.BGE_INDEX_DIR)
+    qwen3_retriever.load_index(config.QWEN_INDEX_DIR)
 
     # 2. 加载测试集
     test_queries_data = data_loader.load_test_set(config.VALIDATION_SET_PATH)
@@ -115,7 +118,7 @@ def main_hybrid():
     print(f"\n>>> Sanity Check Query: {sample_query}")
     results = hybrid_retrieve_and_rerank(query=sample_query,
                                          first_retriever=bm25_retriever,
-                                         second_retriever=bge_retriever,
+                                         second_retriever=qwen3_retriever,
                                          reranker=reranker,
                                          doc_id_to_text_map=doc_id_to_text,
                                          retrieval_top_k=50,  # 粗排召回数量
@@ -139,7 +142,7 @@ def main_hybrid():
             second_retriever=bge_retriever,
             reranker=reranker,
             doc_id_to_text_map=doc_id_to_text,
-            retrieval_top_k=50,  # 粗排召回数量
+            retrieval_top_k=100,  # 粗排召回数量
             rerank_top_k=10  # 最终输出数量
         )
 

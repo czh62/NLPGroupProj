@@ -38,7 +38,7 @@ def compute_metrics(qrels: dict[str, dict[str, int]], results: dict[str, dict[st
 def main():
     parser = argparse.ArgumentParser(description='Evaluate retrieval results.')
     parser.add_argument('--gold', '-g', default="COMP5423-25Fall-HQ-small/validation.jsonl" ,type=str, help='Path to the gold file.')
-    parser.add_argument('--pred', '-p', default="data/bge_test_prediction.jsonl", type=str, help='Path to the predicted file.')
+    parser.add_argument('--pred', '-p', default="data/hybrid_rerank_predictions.jsonl", type=str, help='Path to the predicted file.')
     args = parser.parse_args()
     gold_data = read_jsonl(args.gold)
     pred_data = read_jsonl(args.pred)
