@@ -20,7 +20,7 @@ class MultiVectorRetriever:
     支持本地 Ollama 推理或 SiliconFlow API 远程批量推理。
     """
 
-    def __init__(self, chunk_size: int = 200, chunk_overlap: int = 20):
+    def __init__(self, chunk_size: int = 200, chunk_overlap: int = 20, api_key: str = None):
         # 1. 核心存储
         self.faiss_index: Optional[faiss.IndexFlatIP] = None
         # 存储 子文档 ID -> 父文档 ID 的映射
@@ -33,6 +33,7 @@ class MultiVectorRetriever:
         self.chunk_overlap = chunk_overlap
         self.is_fitted = False
         self.ID_KEY = "parent_doc_id"  # 唯一ID键
+        self.api_key = api_key
 
     def _get_embeddings(self, texts: List[str], is_query: bool = False) -> np.ndarray:
         """
@@ -48,17 +49,14 @@ class MultiVectorRetriever:
         else:
             processed_texts = texts
 
-        # 检查是否使用 API (SiliconFlow)
-        api_key = getattr(config, "SF_API_KEY", None)
-
         # 容器用于存放原始向量列表
         raw_embeddings = []
 
         # ==================== 分支 A: 使用 SiliconFlow API (Batch) ====================
-        if api_key:
+        if self.api_key:
             url = config.SF_API_EMBEDDING_URL
             headers = {
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
             }
 
@@ -273,14 +271,15 @@ def main():
     主程序：Multi-Vector 检索器的构建、加载与批量测试。
     """
     data_loader = HQSmallDataLoader(config.BASE_DATA_DIR)
-    # 使用较小的切块进行检索
-    retriever = MultiVectorRetriever(chunk_size=100, chunk_overlap=20)
+
 
     # 检查 API Key 状态并打印当前模式
     if getattr(config, "SF_API_KEY", None):
         print(f">>> Using SiliconFlow API for embeddings (Model: {config.SF_BGE_MODEL_NAME})")
+        retriever = MultiVectorRetriever(chunk_size=100, chunk_overlap=20, api_key = config.SF_API_KEY)
     else:
         print(f">>> Using Local Ollama for embeddings (Model: {config.BGE_MODEL_NAME})")
+        retriever = MultiVectorRetriever(chunk_size=100, chunk_overlap=20)
 
     # 1. 索引管理
     index_file_check = os.path.join(config.MULTI_VECTOR_INDEX_DIR, "faiss.index")

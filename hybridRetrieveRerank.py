@@ -97,16 +97,19 @@ def main_hybrid():
     all_doc_ids, all_documents = data_loader.load_collection(config.COLLECTION_PATH)
     doc_id_to_text = dict(zip(all_doc_ids, all_documents))
 
-    # 初始化三个模型
-    bm25_retriever = BM25Retriever()
-    bge_retriever = BGERetriever()
-    qwen3_retriever = Qwen3Retriever()
+
     if getattr(config, "SF_API_KEY", None):
-        print(f">>> Using SiliconFlow API for rerank (Model: {config.BGE_RERANKER_MODEL_NAME})")
+        print(f">>> Using SiliconFlow API")
         reranker = BGEReranker(api_key=config.SF_API_KEY)
+        bm25_retriever = BM25Retriever()
+        bge_retriever = BGERetriever(api_key=config.SF_API_KEY)
+        qwen3_retriever = Qwen3Retriever(api_key=config.SF_API_KEY)
     else:
-        print(f">>> Using Local Ollama for rerank (Model: {config.BGE_RERANKER_MODEL_NAME})")
+        print(f">>> Using Local Ollama")
         reranker = BGEReranker()  # 第一次运行会自动下载模型
+        bm25_retriever = BM25Retriever()
+        bge_retriever = BGERetriever()
+        qwen3_retriever = Qwen3Retriever()
 
     # 加载索引 (假设你已经按照之前的脚本生成了索引)
     print("Loading indices...")

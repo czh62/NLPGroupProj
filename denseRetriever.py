@@ -18,18 +18,16 @@ class BGERetriever:
     支持本地 Ollama 逐个推理或 SiliconFlow API 远程批量推理。
     """
 
-    def __init__(self):
+    def __init__(self,  api_key: str = None):
         self.doc_ids: List[str] = []
         self.documents: List[str] = []
         self.index: faiss.IndexFlatIP = None
         self.is_fitted = False
+        self.api_key = api_key
 
     def _get_embeddings(self, texts: List[str], is_query: bool = False) -> np.ndarray:
         """
         核心工具方法：获取文本列表的 L2 归一化向量。
-        逻辑：
-        1. 如果 config 中有 SF_API_KEY，则使用 SiliconFlow API 进行 Batch 推理。
-        2. 否则使用 Ollama 进行逐个推理并拼接。
         """
         # BGE 通常不需要指令，但如果需要，可以从 config 中读取
         # BGE 文档通常推荐在查询前添加 '为这个句子生成表示用于检索相关文档:'
@@ -39,17 +37,14 @@ class BGERetriever:
         else:
             processed_texts = texts
 
-        # 检查是否使用 API (SiliconFlow)
-        api_key = getattr(config, "SF_API_KEY", None)
-
         # 容器用于存放原始向量列表
         raw_embeddings = []
 
         # ==================== 分支 A: 使用 SiliconFlow API (Batch) ====================
-        if api_key:
+        if self.api_key:
             url = config.SF_API_EMBEDDING_URL
             headers = {
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
             }
 
@@ -120,7 +115,7 @@ class BGERetriever:
         self.doc_ids = doc_ids if doc_ids else [str(i) for i in range(len(documents))]
 
         # 确定使用的模型名称以便打印
-        model_name = config.SF_BGE_MODEL_NAME if getattr(config, "SF_API_KEY", None) else config.BGE_MODEL_NAME
+        model_name = config.SF_BGE_MODEL_NAME if self.api_key else config.BGE_MODEL_NAME
         print(f"Total documents: {len(documents)}. Generating embeddings using {model_name}...")
 
         doc_vectors_list = []
@@ -213,13 +208,15 @@ def main():
     主程序：BGE 检索器的构建、加载与批量测试。
     """
     data_loader = HQSmallDataLoader(config.BASE_DATA_DIR)
-    retriever = BGERetriever()
+
 
     # 检查 API Key 状态并打印当前模式
     if getattr(config, "SF_API_KEY", None):
         print(f">>> Using SiliconFlow API for embeddings (Model: {config.SF_BGE_MODEL_NAME})")
+        retriever = BGERetriever(api_key = config.SF_API_KEY)
     else:
         print(f">>> Using Local Ollama for embeddings (Model: {config.BGE_MODEL_NAME})")
+        retriever = BGERetriever()
 
     # 1. 索引管理
     index_file_check = os.path.join(config.BGE_INDEX_DIR, "faiss.index")

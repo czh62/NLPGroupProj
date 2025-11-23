@@ -18,11 +18,12 @@ class Qwen3Retriever:
     支持本地 Ollama 推理或 SiliconFlow API 远程批量推理。
     """
 
-    def __init__(self):
+    def __init__(self, api_key: str = None):
         self.doc_ids: List[str] = []
         self.documents: List[str] = []
         self.index: faiss.IndexFlatIP = None
         self.is_fitted = False
+        self.api_key = api_key
 
     def _get_embeddings(self, texts: List[str], is_query: bool = False) -> np.ndarray:
         """
@@ -35,17 +36,15 @@ class Qwen3Retriever:
         instruction = config.QWEN_QUERY_INSTRUCTION if is_query else config.QWEN_DOC_INSTRUCTION
         processed_texts = [instruction + text for text in texts]
 
-        # 检查是否使用 API (SiliconFlow)
-        api_key = getattr(config, "SF_API_KEY", None)
 
         # 容器用于存放原始向量列表
         raw_embeddings = []
 
         # ==================== 分支 A: 使用 SiliconFlow API (Batch) ====================
-        if api_key:
+        if self.api_key:
             url = config.SF_API_EMBEDDING_URL
             headers = {
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
             }
 
@@ -204,13 +203,15 @@ def main():
     主程序：Qwen3 检索器的构建、加载与批量测试。
     """
     data_loader = HQSmallDataLoader(config.BASE_DATA_DIR)
-    retriever = Qwen3Retriever()
+
 
     # 检查 API Key 状态
     if getattr(config, "SF_API_KEY", None):
         print(f">>> Using SiliconFlow API for embeddings (Model: {config.SF_QWEN_MODEL_NAME})")
+        retriever = Qwen3Retriever(api_key = config.SF_API_KEY)
     else:
         print(f">>> Using Local Ollama for embeddings (Model: {config.QWEN_MODEL_NAME})")
+        retriever = Qwen3Retriever()
 
     # 1. 索引管理
     index_file_check = os.path.join(config.QWEN_INDEX_DIR, "faiss.index")
