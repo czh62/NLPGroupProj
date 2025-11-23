@@ -43,6 +43,7 @@ MODEL2VEC_BATCH_SIZE = 256  # 批量编码的大小
 
 # Ollama 服务配置 (用于 BGE 和 Qwen)
 OLLAMA_API_URL = "http://localhost:11434/api/embeddings"
+SF_API_URL = "https://api.siliconflow.cn/v1/rerank"
 
 # BGE 模型配置
 BGE_MODEL_NAME = "bge-m3"

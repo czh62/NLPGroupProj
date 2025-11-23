@@ -5,6 +5,7 @@ from typing import List, Tuple
 from tqdm import tqdm
 
 import config
+import test
 from BGEReranker import BGEReranker
 from BM25Retriever import BM25Retriever
 from HQSmallDataLoader import HQSmallDataLoader
@@ -98,7 +99,7 @@ def main_hybrid():
     # 初始化三个模型
     bm25_retriever = BM25Retriever()
     bge_retriever = BGERetriever()
-    reranker = BGEReranker()  # 第一次运行会自动下载模型
+    reranker = BGEReranker(api_key=test.API_KEY)  # 第一次运行会自动下载模型
 
     # 加载索引 (假设你已经按照之前的脚本生成了索引)
     print("Loading indices...")
@@ -119,7 +120,7 @@ def main_hybrid():
                                          doc_id_to_text_map=doc_id_to_text,
                                          retrieval_top_k=50,  # 粗排召回数量
                                          rerank_top_k=10  # 最终输出数量
-                                        )
+                                         )
     print("Top 10 results:")
     for i, (doc_id, score) in enumerate(results, 1):
         print(f"  {i}. DocID: {doc_id}, Score: {score:.4f}")
