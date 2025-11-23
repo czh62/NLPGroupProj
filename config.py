@@ -47,6 +47,7 @@ OLLAMA_API_URL = "http://localhost:11434/api/embeddings"
 # BGE 模型配置
 BGE_MODEL_NAME = "bge-m3"
 BGE_VECTOR_DIM = 1024
+BGE_RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
 # Qwen3 模型配置
 QWEN_MODEL_NAME = "qwen3-embedding:8b"

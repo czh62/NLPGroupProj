@@ -232,13 +232,12 @@ def main():
         retriever.save_index(config.MULTI_VECTOR_INDEX_DIR)
 
     # 2. 单条查询测试 (Sanity Check)
-    sample_query = "关于多向量检索器的核心优势是什么？"
+    sample_query = "Which airport is located in Maine, Sacramento International Airport or Knox County Regional Airport?"
     print(f"\n>>> Sanity Check Query: {sample_query}")
-    results = retriever.query(sample_query, top_k=3)  # 只看 Top 3
-    print("Top 3 results (Parent Document):")
+    results = retriever.query(sample_query, top_k=10)
+    print("Top 10 results:")
     for i, (doc_id, content, score) in enumerate(results, 1):
         print(f"  {i}. DocID: {doc_id}, Score: {score:.4f}")
-        print(f"     Content Snippet: {content[:50]}...")  # 打印部分内容
 
     # 3. 批量处理测试集 (Test Set)
     print(f"\n>>> Batch Processing Test Set from {config.VALIDATION_SET_PATH}...")
