@@ -15,9 +15,7 @@ from HQSmallDataLoader import HQSmallDataLoader
 class Qwen3Retriever:
     """
     基于 Qwen3-Embedding (Large) 的稠密检索器。
-    特点：
-    1. 高维向量 (4096维)。
-    2. 需要区分 Query 和 Document 的 Prompt 指令。
+    支持本地 Ollama 推理或 SiliconFlow API 远程批量推理。
     """
 
     def __init__(self):
@@ -26,70 +24,122 @@ class Qwen3Retriever:
         self.index: faiss.IndexFlatIP = None
         self.is_fitted = False
 
-    def _get_embedding(self, text: str, is_query: bool = False) -> np.ndarray:
+    def _get_embeddings(self, texts: List[str], is_query: bool = False) -> np.ndarray:
         """
-        核心工具方法：调用 Ollama 接口获取单个文本的 L2 归一化向量。
-        关键点：根据 is_query 添加不同的 Instruction 前缀。
+        核心工具方法：获取文本列表的 L2 归一化向量。
+        逻辑：
+        1. 如果 config 中有 API KEY，则使用 SiliconFlow API 进行 Batch 推理。
+        2. 否则使用 Ollama 进行逐个推理并拼接。
         """
-        # 根据 Qwen 文档，Query 和 Doc 通常需要不同的指令前缀
+        # 1. 预处理：根据 Qwen 文档添加指令前缀
         instruction = config.QWEN_QUERY_INSTRUCTION if is_query else config.QWEN_DOC_INSTRUCTION
+        processed_texts = [instruction + text for text in texts]
 
-        full_prompt = instruction + text
-        payload = {
-            "model": config.QWEN_MODEL_NAME,
-            "prompt": full_prompt
-        }
-        try:
-            resp = requests.post(config.OLLAMA_API_URL, json=payload, timeout=120)
-            resp.raise_for_status()
+        # 检查是否使用 API (SiliconFlow)
+        api_key = getattr(config, "SF_API_KEY", None)
 
-            emb = resp.json()["embedding"]
+        # 容器用于存放原始向量列表
+        raw_embeddings = []
 
-            # 维度检查
-            if len(emb) != config.QWEN_VECTOR_DIM:
-                # 仅警告，有些量化版本可能会改变维度，但通常不会
-                pass
+        # ==================== 分支 A: 使用 SiliconFlow API (Batch) ====================
+        if api_key:
+            url = config.SF_API_EMBEDDING_URL
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
 
-            # 转换为 numpy 数组 (dtype=np.float32)，注意外部列表是必须的，以保持 (1 x Dim) 形状
-            embedding_np = np.array([emb], dtype=np.float32)
+            payload = {
+                "model": config.SF_QWEN_MODEL_NAME,  # 确保 config 中的模型名也是 SiliconFlow 支持的 ID
+                "input": processed_texts,
+                "encoding_format": "float"
+            }
 
-            # 归一化以适配余弦相似度检索
-            faiss.normalize_L2(embedding_np)
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=120)
+                resp.raise_for_status()
+                resp_json = resp.json()
 
-            # 返回形状为 (1 x Dim) 的数组
-            return embedding_np
+                # 假设 OpenAI 格式: {"data": [{"embedding": [...]}, ...]}
+                # 按照 index 排序确保顺序一致
+                data_items = sorted(resp_json["data"], key=lambda x: x["index"])
+                raw_embeddings = [item["embedding"] for item in data_items]
 
-        except Exception as e:
-            print(f"Ollama embedding error for text segment: {text[:30]}...")
-            print(f"Error: {e}")
-            raise
+            except Exception as e:
+                print(f"SiliconFlow API error: {e}")
+                # 这里可以选择抛出异常或者降级，这里选择抛出
+                raise
+
+        # ==================== 分支 B: 使用 Ollama 本地 (Iterative) ====================
+        else:
+            # 逐个调用 Ollama
+            for text in processed_texts:
+                payload = {
+                    "model": config.QWEN_MODEL_NAME,
+                    "prompt": text
+                }
+                try:
+                    resp = requests.post(config.OLLAMA_API_URL, json=payload, timeout=120)
+                    resp.raise_for_status()
+                    emb = resp.json()["embedding"]
+                    raw_embeddings.append(emb)
+                except Exception as e:
+                    print(f"Ollama embedding error for text segment: {text[:30]}...")
+                    raise e
+
+        # ==================== 后处理：转 Numpy + 归一化 ====================
+
+        if not raw_embeddings:
+            raise ValueError("No embeddings were generated.")
+
+        # 转换为 (Batch_Size, Dim)
+        embeddings_np = np.array(raw_embeddings, dtype=np.float32)
+
+        # 维度检查 (取第一行检查)
+        if embeddings_np.shape[1] != config.QWEN_VECTOR_DIM:
+            # 仅打印警告，防止不同量化版本维度差异
+            pass
+
+        # 归一化 (In-place L2 normalization for Cosine Similarity)
+        faiss.normalize_L2(embeddings_np)
+
+        return embeddings_np
 
     def fit(self, documents: List[str], doc_ids: List[str] = None):
         """
         构建索引：对文档库进行 Embedding 并存入 FAISS。
+        使用 Batch 处理以适配 _get_embeddings 的 API 优势。
         """
         self.documents = documents
         self.doc_ids = doc_ids if doc_ids else [str(i) for i in range(len(documents))]
 
-        print(f"Total documents: {len(documents)}. Generating Qwen3 embeddings...")
+        print(f"Total documents: {len(documents)}. Generating embeddings...")
 
-        doc_vectors = []
-        # 注意：Document 侧通常不需要特殊指令，或使用空指令 (is_query=False)
-        for doc in tqdm(documents, desc="Vectorizing Documents"):
+        doc_vectors_list = []
+
+        # 定义 Batch Size (API 模式建议大一点，比如 32-64；Ollama 模式无所谓，内部是串行的)
+        # 如果使用 SiliconFlow，建议设为 16 ~ 64，取决于文本长度限制
+
+        # 使用 tqdm 显示进度，步长为 batch_size
+        for i in tqdm(range(0, len(documents), config.BATCH_SIZE), desc="Vectorizing Batches"):
+            batch_docs = documents[i: i + config.BATCH_SIZE]
             try:
-                # 获取单个文档向量 (shape: 1 x Dim) 并追加到列表中
-                vector = self._get_embedding(doc, is_query=False)
-                doc_vectors.append(vector)
-            except Exception:
-                # 遇到错误时停止处理
+                # 调用新方法，批量获取向量 (N x Dim)
+                batch_vectors = self._get_embeddings(batch_docs, is_query=False)
+                doc_vectors_list.append(batch_vectors)
+            except Exception as e:
+                print(f"Error processing batch starting at index {i}: {e}")
                 raise
 
-        # 将所有文档向量堆叠成一个 NumPy 数组 (shape: N x Dim)
-        doc_vectors_np = np.vstack(doc_vectors)
+        # 将所有 Batch 的结果堆叠成一个大数组 (Total_N x Dim)
+        if doc_vectors_list:
+            all_vectors_np = np.vstack(doc_vectors_list)
+        else:
+            raise ValueError("No documents were vectorized.")
 
-        print("Building FAISS IndexFlatIP...")
+        print(f"Building FAISS IndexFlatIP with shape {all_vectors_np.shape}...")
         self.index = faiss.IndexFlatIP(config.QWEN_VECTOR_DIM)
-        self.index.add(doc_vectors_np)
+        self.index.add(all_vectors_np)
 
         self.is_fitted = True
         print("Qwen3 Retriever fitted successfully!")
@@ -101,7 +151,9 @@ class Qwen3Retriever:
         if not self.is_fitted:
             raise ValueError("Qwen3Retriever not fitted yet.")
 
-        query_vec = self._get_embedding(query_text, is_query=True)
+        # 将单个 Query 放入列表调用 _get_embeddings
+        # 返回 shape (1, Dim)
+        query_vec = self._get_embeddings([query_text], is_query=True)
 
         # 搜索 Top-K
         scores, indices = self.index.search(query_vec, top_k)
@@ -124,7 +176,7 @@ class Qwen3Retriever:
         print("Saving FAISS index...")
         faiss.write_index(self.index, os.path.join(dirpath, "faiss.index"))
 
-        # 可选：保存原文以便调试
+        # 保存原文
         with open(os.path.join(dirpath, "documents.jsonl"), "w", encoding="utf-8") as f:
             for doc_id, text in zip(self.doc_ids, self.documents):
                 f.write(json.dumps({"id": doc_id, "text": text}, ensure_ascii=False) + "\n")
@@ -153,6 +205,12 @@ def main():
     """
     data_loader = HQSmallDataLoader(config.BASE_DATA_DIR)
     retriever = Qwen3Retriever()
+
+    # 检查 API Key 状态
+    if getattr(config, "SF_API_KEY", None):
+        print(f">>> Using SiliconFlow API for embeddings (Model: {config.SF_QWEN_MODEL_NAME})")
+    else:
+        print(f">>> Using Local Ollama for embeddings (Model: {config.QWEN_MODEL_NAME})")
 
     # 1. 索引管理
     index_file_check = os.path.join(config.QWEN_INDEX_DIR, "faiss.index")

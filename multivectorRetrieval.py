@@ -14,9 +14,10 @@ from HQSmallDataLoader import HQSmallDataLoader
 
 class MultiVectorRetriever:
     """
-    基于自定义切分和 Ollama 向量的 Multi-Vector 检索器。
+    基于自定义切分和 Ollama/API 向量的 Multi-Vector 检索器。
     它将大的“父文档”切分成小的“子文档”进行索引，
     但检索时返回完整的父文档内容。
+    支持本地 Ollama 推理或 SiliconFlow API 远程批量推理。
     """
 
     def __init__(self, chunk_size: int = 200, chunk_overlap: int = 20):
@@ -33,36 +34,85 @@ class MultiVectorRetriever:
         self.is_fitted = False
         self.ID_KEY = "parent_doc_id"  # 唯一ID键
 
-    def _get_embedding(self, text: str) -> np.ndarray:
+    def _get_embeddings(self, texts: List[str], is_query: bool = False) -> np.ndarray:
         """
-        核心工具方法：调用 Ollama 接口获取单个文本的 L2 归一化向量。
+        核心工具方法：获取文本列表的 L2 归一化向量。
+        逻辑：
+        1. 如果 config 中有 SF_API_KEY，则使用 SiliconFlow API 进行 Batch 推理。
+        2. 否则使用 Ollama 进行逐个推理并拼接。
         """
-        # 构造请求体
-        payload = {
-            "model": config.BGE_MODEL_NAME,
-            "prompt": text
-        }
-        try:
-            resp = requests.post(config.OLLAMA_API_URL, json=payload, timeout=60)
-            resp.raise_for_status()
+        # BGE 模型通常在查询时需要指令，但文档不需要。
+        if is_query and getattr(config, "BGE_QUERY_INSTRUCTION", None):
+            instruction = config.BGE_QUERY_INSTRUCTION
+            processed_texts = [instruction + text for text in texts]
+        else:
+            processed_texts = texts
 
-            # 解析响应
-            vec = resp.json()["embedding"]
+        # 检查是否使用 API (SiliconFlow)
+        api_key = getattr(config, "SF_API_KEY", None)
 
-            # 转换为 numpy 数组 (dtype=np.float32)，注意外部列表是必须的，以保持 (1 x Dim) 形状
-            embedding_np = np.array([vec], dtype=np.float32)
+        # 容器用于存放原始向量列表
+        raw_embeddings = []
 
-            # 进行 L2 归一化 (BGE/稠密检索器的标准操作)
-            faiss.normalize_L2(embedding_np)
+        # ==================== 分支 A: 使用 SiliconFlow API (Batch) ====================
+        if api_key:
+            url = config.SF_API_EMBEDDING_URL
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
 
-            # 返回形状为 (1 x Dim) 的数组
-            return embedding_np
+            payload = {
+                "model": config.SF_BGE_MODEL_NAME,  # 假设 config 中有对应的 BGE 模型名
+                "input": processed_texts,
+                "encoding_format": "float"
+            }
 
-        except Exception as e:
-            # 打印前 30 个字符
-            print(f"Embedding request failed for text segment: {text[:30]}...")
-            print(f"Error: {e}")
-            raise  # 中断处理
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=120)
+                resp.raise_for_status()
+                resp_json = resp.json()
+
+                # 假设 OpenAI 格式: {"data": [{"embedding": [...]}, ...]}
+                # 按照 index 排序确保顺序一致
+                data_items = sorted(resp_json["data"], key=lambda x: x["index"])
+                raw_embeddings = [item["embedding"] for item in data_items]
+
+            except Exception as e:
+                print(f"SiliconFlow API error: {e}")
+                # 抛出异常
+                raise
+
+        # ==================== 分支 B: 使用 Ollama 本地 (Iterative) ====================
+        else:
+            # 逐个调用 Ollama
+            for text in processed_texts:
+                payload = {
+                    "model": config.BGE_MODEL_NAME,
+                    "prompt": text
+                }
+                try:
+                    # 使用较短的超时时间，因为是单次请求
+                    resp = requests.post(config.OLLAMA_API_URL, json=payload, timeout=60)
+                    resp.raise_for_status()
+                    emb = resp.json()["embedding"]
+                    raw_embeddings.append(emb)
+                except Exception as e:
+                    print(f"Ollama embedding error for text segment: {text[:30]}...")
+                    raise e
+
+        # ==================== 后处理：转 Numpy + 归一化 ====================
+
+        if not raw_embeddings:
+            raise ValueError("No embeddings were generated.")
+
+        # 转换为 (Batch_Size, Dim)
+        embeddings_np = np.array(raw_embeddings, dtype=np.float32)
+
+        # 归一化 (In-place L2 normalization for Cosine Similarity)
+        faiss.normalize_L2(embeddings_np)
+
+        return embeddings_np
 
     def _simple_text_splitter(self, text: str) -> List[str]:
         """简单的文本切分模拟 (LangChain RecursiveCharacterTextSplitter 的功能)"""
@@ -83,18 +133,17 @@ class MultiVectorRetriever:
         构建索引：
         1. 存储父文档内容。
         2. 对每个父文档进行切分，生成子文档。
-        3. 索引子文档的向量到 FAISS。
-        **修改点：通过循环调用 _get_embedding 处理批量子文档**
+        3. 使用批量方法 _get_embeddings 索引子文档的向量到 FAISS。
         """
         print(f"Building Multi-Vector Index for {len(documents)} documents...")
 
         sub_documents: List[str] = []
 
-        # 存储父文档内容
+        # 1. 存储父文档内容
         for parent_id, content in zip(doc_ids, documents):
             self.parent_id_to_content[parent_id] = content
 
-        # 切分并收集子文档
+        # 2. 切分并收集子文档
         print("Splitting documents into chunks (Sub-Documents)...")
         for parent_id, content in tqdm(zip(doc_ids, documents), total=len(documents), desc="Splitting"):
             chunks = self._simple_text_splitter(content)
@@ -108,20 +157,28 @@ class MultiVectorRetriever:
         print(f"Total sub-documents (chunks) created: {len(sub_documents)}")
         print(f"Generating embeddings for {len(sub_documents)} sub-documents...")
 
-        # 循环调用 _get_embedding
-        sub_doc_vectors = []
-        for doc in tqdm(sub_documents, desc="Vectorizing Sub-Documents"):
+        # 3. 向量化和索引 (Batch processing)
+        sub_doc_vectors_list = []
+
+        # 使用 tqdm 显示进度，步长为 config.BATCH_SIZE
+        for i in tqdm(range(0, len(sub_documents), config.BATCH_SIZE), desc="Vectorizing Batches"):
+            batch_docs = sub_documents[i: i + config.BATCH_SIZE]
             try:
-                # _get_embedding 返回 (1 x Dim) 数组
-                vector = self._get_embedding(doc)
-                sub_doc_vectors.append(vector)
-            except Exception:
+                # 调用批量方法，批量获取向量 (N x Dim)
+                # is_query=False 因为是文档向量
+                batch_vectors = self._get_embeddings(batch_docs, is_query=False)
+                sub_doc_vectors_list.append(batch_vectors)
+            except Exception as e:
+                print(f"Error processing batch starting at index {i}: {e}")
                 raise
 
         # 将所有子文档向量堆叠成一个 NumPy 数组 (shape: N x Dim)
-        sub_doc_vectors_np = np.vstack(sub_doc_vectors)
+        if sub_doc_vectors_list:
+            sub_doc_vectors_np = np.vstack(sub_doc_vectors_list)
+        else:
+            raise ValueError("No sub-documents were vectorized.")
 
-        print("Building FAISS IndexFlatIP for Sub-Documents...")
+        print(f"Building FAISS IndexFlatIP for Sub-Documents with shape {sub_doc_vectors_np.shape}...")
         self.faiss_index = faiss.IndexFlatIP(config.BGE_VECTOR_DIM)
         self.faiss_index.add(sub_doc_vectors_np)
 
@@ -135,13 +192,13 @@ class MultiVectorRetriever:
         2. 在 FAISS 索引中查找 top_k 个最相似的 子文档 ID。
         3. 利用映射找到对应的 父文档 ID。
         4. 去重，并返回 父文档内容。
-        **修改点：调用 _get_embedding 获取单个查询向量**
         """
         if not self.is_fitted:
             raise ValueError("MultiVectorRetriever not fitted yet.")
 
         # 获取查询向量 (shape: 1 x Dim)
-        query_vec = self._get_embedding(query_text)
+        # 将单个 Query 放入列表调用 _get_embeddings
+        query_vec = self._get_embeddings([query_text], is_query=True)
 
         # FAISS 搜索 (检索的是子文档的索引)
         scores, indices = self.faiss_index.search(query_vec, top_k * 5)  # 检索更多，以便去重后有足够的父文档
@@ -218,6 +275,12 @@ def main():
     data_loader = HQSmallDataLoader(config.BASE_DATA_DIR)
     # 使用较小的切块进行检索
     retriever = MultiVectorRetriever(chunk_size=100, chunk_overlap=20)
+
+    # 检查 API Key 状态并打印当前模式
+    if getattr(config, "SF_API_KEY", None):
+        print(f">>> Using SiliconFlow API for embeddings (Model: {config.SF_BGE_MODEL_NAME})")
+    else:
+        print(f">>> Using Local Ollama for embeddings (Model: {config.BGE_MODEL_NAME})")
 
     # 1. 索引管理
     index_file_check = os.path.join(config.MULTI_VECTOR_INDEX_DIR, "faiss.index")

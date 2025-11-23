@@ -14,7 +14,7 @@ class BGEReranker:
                  model_name: str = config.BGE_RERANKER_MODEL_NAME,
                  device: str = None,
                  api_key: str = None,
-                 api_url: str = config.SF_API_URL):
+                 api_url: str = config.SF_API_RERANK_URL):
         self.model_name = model_name
         self.api_key = api_key
         self.api_url = api_url

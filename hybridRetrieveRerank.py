@@ -101,7 +101,12 @@ def main_hybrid():
     bm25_retriever = BM25Retriever()
     bge_retriever = BGERetriever()
     qwen3_retriever = Qwen3Retriever()
-    reranker = BGEReranker(api_key=test.API_KEY)  # 第一次运行会自动下载模型
+    if getattr(config, "SF_API_KEY", None):
+        print(f">>> Using SiliconFlow API for rerank (Model: {config.BGE_RERANKER_MODEL_NAME})")
+        reranker = BGEReranker(api_key=config.SF_API_KEY)
+    else:
+        print(f">>> Using Local Ollama for rerank (Model: {config.BGE_RERANKER_MODEL_NAME})")
+        reranker = BGEReranker()  # 第一次运行会自动下载模型
 
     # 加载索引 (假设你已经按照之前的脚本生成了索引)
     print("Loading indices...")
@@ -139,7 +144,7 @@ def main_hybrid():
         final_top_docs = hybrid_retrieve_and_rerank(
             query=query_text,
             first_retriever=bm25_retriever,
-            second_retriever=bge_retriever,
+            second_retriever=qwen3_retriever,
             reranker=reranker,
             doc_id_to_text_map=doc_id_to_text,
             retrieval_top_k=100,  # 粗排召回数量

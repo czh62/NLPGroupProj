@@ -15,76 +15,136 @@ from HQSmallDataLoader import HQSmallDataLoader
 class BGERetriever:
     """
     基于 BGE-M3 (BAAI General Embedding) 的稠密检索器。
-    原理：
-    1. 调用本地 Ollama API 获取文本的 Embedding 向量。
-    2. 使用 FAISS 进行向量索引和检索。
+    支持本地 Ollama 逐个推理或 SiliconFlow API 远程批量推理。
     """
 
     def __init__(self):
         self.doc_ids: List[str] = []
         self.documents: List[str] = []
-        self.index: faiss.IndexFlatIP = None  # BGE 推荐使用内积（归一化后等同于余弦相似度）
+        self.index: faiss.IndexFlatIP = None
         self.is_fitted = False
 
-    def _get_embedding(self, text: str) -> np.ndarray:
+    def _get_embeddings(self, texts: List[str], is_query: bool = False) -> np.ndarray:
         """
-        核心工具方法：调用 Ollama 接口获取单个文本的向量。
+        核心工具方法：获取文本列表的 L2 归一化向量。
+        逻辑：
+        1. 如果 config 中有 SF_API_KEY，则使用 SiliconFlow API 进行 Batch 推理。
+        2. 否则使用 Ollama 进行逐个推理并拼接。
         """
-        # 构造请求体
-        payload = {
-            "model": config.BGE_MODEL_NAME,
-            "prompt": text
-        }
-        try:
-            resp = requests.post(config.OLLAMA_API_URL, json=payload, timeout=60)
-            resp.raise_for_status()
+        # BGE 通常不需要指令，但如果需要，可以从 config 中读取
+        # BGE 文档通常推荐在查询前添加 '为这个句子生成表示用于检索相关文档:'
+        if is_query and getattr(config, "BGE_QUERY_INSTRUCTION", None):
+            instruction = config.BGE_QUERY_INSTRUCTION
+            processed_texts = [instruction + text for text in texts]
+        else:
+            processed_texts = texts
 
-            # 解析响应
-            vec = resp.json()["embedding"]
+        # 检查是否使用 API (SiliconFlow)
+        api_key = getattr(config, "SF_API_KEY", None)
 
-            # 维度校验
-            if len(vec) != config.BGE_VECTOR_DIM:
-                print(f"Warning: Expected dim {config.BGE_VECTOR_DIM}, got {len(vec)}")
+        # 容器用于存放原始向量列表
+        raw_embeddings = []
 
-            # 转换为 numpy 数组 (dtype=np.float32)
-            embedding_np = np.array([vec], dtype=np.float32)
+        # ==================== 分支 A: 使用 SiliconFlow API (Batch) ====================
+        if api_key:
+            url = config.SF_API_EMBEDDING_URL
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
 
-            # 进行 L2 归一化 (BGE 模型的标准操作)
-            faiss.normalize_L2(embedding_np)
+            payload = {
+                "model": config.SF_BGE_MODEL_NAME,  # 假设 config 中有对应的 BGE 模型名
+                "input": processed_texts,
+                "encoding_format": "float"
+            }
 
-            # 返回形状为 (1 x Dim) 的数组
-            return embedding_np
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=120)
+                resp.raise_for_status()
+                resp_json = resp.json()
 
-        except Exception as e:
-            print(f"Embedding request failed for text segment: {text[:30]}...")
-            print(f"Error: {e}")
-            raise
+                # 假设 OpenAI 格式: {"data": [{"embedding": [...]}, ...]}
+                # 按照 index 排序确保顺序一致
+                data_items = sorted(resp_json["data"], key=lambda x: x["index"])
+                raw_embeddings = [item["embedding"] for item in data_items]
+
+            except Exception as e:
+                print(f"SiliconFlow API error: {e}")
+                # 抛出异常
+                raise
+
+        # ==================== 分支 B: 使用 Ollama 本地 (Iterative) ====================
+        else:
+            # 逐个调用 Ollama
+            for text in processed_texts:
+                payload = {
+                    "model": config.BGE_MODEL_NAME,
+                    "prompt": text
+                }
+                try:
+                    # 使用较短的超时时间，因为是单次请求
+                    resp = requests.post(config.OLLAMA_API_URL, json=payload, timeout=60)
+                    resp.raise_for_status()
+                    emb = resp.json()["embedding"]
+                    raw_embeddings.append(emb)
+                except Exception as e:
+                    print(f"Ollama embedding error for text segment: {text[:30]}...")
+                    raise e
+
+        # ==================== 后处理：转 Numpy + 归一化 ====================
+
+        if not raw_embeddings:
+            raise ValueError("No embeddings were generated.")
+
+        # 转换为 (Batch_Size, Dim)
+        embeddings_np = np.array(raw_embeddings, dtype=np.float32)
+
+        # 维度检查 (取第一行检查)
+        if embeddings_np.shape[1] != config.BGE_VECTOR_DIM:
+            # 仅打印警告，防止不同量化版本维度差异
+            pass
+
+        # 归一化 (In-place L2 normalization for Cosine Similarity)
+        faiss.normalize_L2(embeddings_np)
+
+        return embeddings_np
+
 
     def fit(self, documents: List[str], doc_ids: List[str] = None):
         """
-        构建索引：遍历所有文档生成向量，并插入 FAISS。
+        构建索引：对文档库进行 Embedding 并存入 FAISS。
+        使用 Batch 处理以适配 _get_embeddings 的 API 优势。
         """
         self.documents = documents
         self.doc_ids = doc_ids if doc_ids else [str(i) for i in range(len(documents))]
 
-        print(f"Generating embeddings for {len(documents)} documents using {config.BGE_MODEL_NAME}...")
+        # 确定使用的模型名称以便打印
+        model_name = config.SF_BGE_MODEL_NAME if getattr(config, "SF_API_KEY", None) else config.BGE_MODEL_NAME
+        print(f"Total documents: {len(documents)}. Generating embeddings using {model_name}...")
 
-        doc_vectors = []
-        for doc in tqdm(documents, desc="Vectorizing Documents"):
+        doc_vectors_list = []
+
+        # 使用 tqdm 显示进度，步长为 config.BATCH_SIZE
+        for i in tqdm(range(0, len(documents), config.BATCH_SIZE), desc="Vectorizing Batches"):
+            batch_docs = documents[i: i + config.BATCH_SIZE]
             try:
-                # 获取单个文档向量 (shape: 1 x Dim) 并追加到列表中
-                vector = self._get_embedding(doc)
-                doc_vectors.append(vector)
-            except Exception:
-                # 遇到错误时停止处理
+                # 调用批量方法，批量获取向量 (N x Dim)
+                batch_vectors = self._get_embeddings(batch_docs, is_query=False)
+                doc_vectors_list.append(batch_vectors)
+            except Exception as e:
+                print(f"Error processing batch starting at index {i}: {e}")
                 raise
 
-        # 将所有文档向量堆叠成一个 NumPy 数组 (shape: N x Dim)
-        doc_vectors_np = np.vstack(doc_vectors)
+        # 将所有 Batch 的结果堆叠成一个大数组 (Total_N x Dim)
+        if doc_vectors_list:
+            all_vectors_np = np.vstack(doc_vectors_list)
+        else:
+            raise ValueError("No documents were vectorized.")
 
-        print("Building FAISS IndexFlatIP...")
+        print(f"Building FAISS IndexFlatIP with shape {all_vectors_np.shape}...")
         self.index = faiss.IndexFlatIP(config.BGE_VECTOR_DIM)
-        self.index.add(doc_vectors_np)
+        self.index.add(all_vectors_np)
 
         self.is_fitted = True
         print("BGE Retriever fitted successfully!")
@@ -96,8 +156,9 @@ class BGERetriever:
         if not self.is_fitted:
             raise ValueError("BGERetriever not fitted yet.")
 
-        # 获取查询向量 (shape: 1 x Dim)
-        query_vec = self._get_embedding(query_text)
+        # 将单个 Query 放入列表调用 _get_embeddings
+        # 返回 shape (1, Dim)
+        query_vec = self._get_embeddings([query_text], is_query=True)
 
         # FAISS 搜索
         # query_vec 已经是 (1 x Dim) 的 NumPy 数组，可以直接用于搜索
@@ -153,6 +214,12 @@ def main():
     """
     data_loader = HQSmallDataLoader(config.BASE_DATA_DIR)
     retriever = BGERetriever()
+
+    # 检查 API Key 状态并打印当前模式
+    if getattr(config, "SF_API_KEY", None):
+        print(f">>> Using SiliconFlow API for embeddings (Model: {config.SF_BGE_MODEL_NAME})")
+    else:
+        print(f">>> Using Local Ollama for embeddings (Model: {config.BGE_MODEL_NAME})")
 
     # 1. 索引管理
     index_file_check = os.path.join(config.BGE_INDEX_DIR, "faiss.index")

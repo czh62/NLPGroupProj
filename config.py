@@ -1,5 +1,7 @@
 import os
 
+from numpy.random import SFC64
+
 # ==================== 路径配置 ====================
 # 基础数据目录
 BASE_DATA_DIR = "./data"
@@ -43,15 +45,20 @@ MODEL2VEC_BATCH_SIZE = 256  # 批量编码的大小
 
 # Ollama 服务配置 (用于 BGE 和 Qwen)
 OLLAMA_API_URL = "http://localhost:11434/api/embeddings"
-SF_API_URL = "https://api.siliconflow.cn/v1/rerank"
+SF_API_RERANK_URL = "https://api.siliconflow.cn/v1/rerank"
+SF_API_EMBEDDING_URL = "https://api.siliconflow.cn/v1/embeddings"
+SF_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
+BATCH_SIZE = 32
 
 # BGE 模型配置
 BGE_MODEL_NAME = "bge-m3"
+SF_BGE_MODEL_NAME = "BAAI/bge-m3"
 BGE_VECTOR_DIM = 1024
 BGE_RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
 # Qwen3 模型配置
 QWEN_MODEL_NAME = "qwen3-embedding:8b"
+SF_QWEN_MODEL_NAME = "Qwen/Qwen3-Embedding-8B"
 QWEN_VECTOR_DIM = 4096
 QWEN_QUERY_INSTRUCTION = "Generate a vector representation for this query to retrieve relevant documents: "
 QWEN_DOC_INSTRUCTION = ""
