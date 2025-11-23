@@ -1,218 +1,207 @@
-import math
+import json
 import os
 import pickle
-from collections import Counter
 from typing import List, Tuple
 
-import faiss
-import nltk
 import numpy as np
-from gensim.models import Word2Vec
-from nltk.corpus import stopwords
+from model2vec import StaticModel
 from tqdm import tqdm
 
+import config
+# 导入数据加载器和统一配置
 from HQSmallDataLoader import HQSmallDataLoader
 
-# 确保第一次运行时下载 stopwords
-try:
-    stop_words = set(stopwords.words("english"))
-except:
-    nltk.download("stopwords")
-    stop_words = set(stopwords.words("english"))
 
-
-class Word2VecRetriever:
+class Model2VecRetriever:
     """
-    使用 Word2Vec + TF-IDF 加权向量 + FAISS 的增强检索器
+    基于 Model2Vec (Static Embeddings) 的稠密检索器实现。
+    将文档和查询转换为向量，并使用余弦相似度进行检索。
     """
 
-    def __init__(self, vector_dim: int = 200, window: int = 5, min_count: int = 1):
-        self.vector_dim = vector_dim
-        self.window = window
-        self.min_count = min_count
+    def __init__(self, model_name: str = config.MODEL2VEC_MODEL_NAME):
+        """
+        初始化 Model2Vec 检索器。
 
-        self.doc_ids: List[str] = []
-        self.documents: List[str] = []
+        Args:
+            model_name (str): HuggingFace 模型名称 (例如 "minishlab/potion-base-8M")。
+        """
+        print(f"Initializing Model2Vec with model: {model_name}")
+        # 加载静态模型
+        self.model = StaticModel.from_pretrained(model_name)
 
-        self.w2v_model: Word2Vec = None
+        # 数据容器
+        self.doc_ids = []  # 存储文档 ID
+        self.doc_embeddings = None  # 存储文档向量矩阵 (numpy array)
 
-        self.index: faiss.IndexFlatIP = None
-        self.doc_vectors: np.ndarray = None
+        self.is_fitted = False  # 标记索引是否已构建
 
-        self.term_df = None
-        self.is_fitted = False
+    def _encode_batch(self, texts: List[str], batch_size: int = config.MODEL2VEC_BATCH_SIZE) -> np.ndarray:
+        """
+        内部方法：批量编码文本为向量。
 
-    # ----------- 文本预处理（增强：停用词过滤） -----------
-    def _preprocess_text(self, text: str) -> List[str]:
-        text = text.lower()
-        tokens = text.split()
-        tokens = [t.strip(".,!?;:\"()[]{}") for t in tokens]
-        tokens = [t for t in tokens if t and t not in stop_words]
-        return tokens
+        Args:
+            texts (List[str]): 文本列表。
+            batch_size (int): 批处理大小。
 
-    # ----------- Word2Vec 训练 -----------
-    def _train_word2vec(self, tokenized_docs: List[List[str]]):
-        print("Training Word2Vec...")
-        self.w2v_model = Word2Vec(
-            sentences=tokenized_docs,
-            vector_size=self.vector_dim,
-            window=self.window,
-            min_count=self.min_count,
-            workers=4
-        )
-        print("Word2Vec training done.")
+        Returns:
+            np.ndarray: 形状为 (len(texts), hidden_dim) 的向量矩阵。
+        """
+        # model2vec 的 encode 方法通常返回列表或 numpy 数组，这里确保转为 numpy
+        embeddings = self.model.encode(texts, batch_size=batch_size, show_progress_bar=True)
+        return np.array(embeddings)
 
-    # ----------- TF-IDF + Word2Vec 文档向量计算（核心增强） -----------
-    def _get_doc_vector(self, tokens: List[str]) -> np.ndarray:
-        vectors = []
-        token_count = Counter(tokens)
+    def fit(self, documents: List[str], doc_ids: List[str] = None) -> None:
+        """
+        构建索引：将所有文档编码为向量并存储。
 
-        total_docs = len(self.documents) + 1  # 避免除 0
+        Args:
+            documents (List[str]): 文档文本列表。
+            doc_ids (List[str], optional): 对应的文档 ID 列表。
+        """
+        if doc_ids is None:
+            self.doc_ids = [str(i) for i in range(len(documents))]
+        else:
+            self.doc_ids = doc_ids
 
-        for t in tokens:
-            if t in self.w2v_model.wv:
-                # TF
-                tf = token_count[t] / len(tokens)
+        print("Starting Model2Vec encoding process...")
 
-                # IDF：df + 1 平滑处理
-                df = self.term_df.get(t, 0) + 1
-                idf = math.log(total_docs / df)
+        # 编码文档
+        # model2vec 非常快，直接对整个列表编码即可
+        self.doc_embeddings = self._encode_batch(documents)
 
-                weight = tf * idf
-                vectors.append(weight * self.w2v_model.wv[t])
-
-        if not vectors:
-            return np.zeros(self.vector_dim, dtype=np.float32)
-
-        return np.mean(vectors, axis=0).astype(np.float32)
-
-    # ----------- 构建所有文档向量 -----------
-    def _build_doc_vectors(self, tokenized_docs: List[List[str]]):
-        print("Building weighted document vectors...")
-        vectors = []
-        for tokens in tqdm(tokenized_docs):
-            vectors.append(self._get_doc_vector(tokens))
-
-        self.doc_vectors = np.vstack(vectors)
-        faiss.normalize_L2(self.doc_vectors)
-
-    # ----------- FIT -----------
-    def fit(self, documents: List[str], doc_ids: List[str] = None):
-        self.documents = documents
-        self.doc_ids = doc_ids if doc_ids else [str(i) for i in range(len(documents))]
-
-        print("Preprocessing documents...")
-        tokenized_docs = [self._preprocess_text(doc) for doc in documents]
-
-        # 统计 document frequency
-        print("Counting document frequency (DF)...")
-        df_counter = Counter()
-        for tokens in tokenized_docs:
-            for t in set(tokens):
-                df_counter[t] += 1
-        self.term_df = df_counter
-
-        # 训练 Word2Vec
-        self._train_word2vec(tokenized_docs)
-
-        # 文档向量构建
-        self._build_doc_vectors(tokenized_docs)
-
-        # 构建 FAISS 索引
-        print("Building FAISS index...")
-        self.index = faiss.IndexFlatIP(self.vector_dim)
-        self.index.add(self.doc_vectors)
+        # 归一化向量以进行余弦相似度计算 (L2 Norm)
+        # 如果模型输出已经是归一化的，这一步可以跳过，但为了保险起见通常执行
+        norm = np.linalg.norm(self.doc_embeddings, axis=1, keepdims=True)
+        self.doc_embeddings = self.doc_embeddings / (norm + 1e-10)
 
         self.is_fitted = True
-        print(f"Word2Vec retriever fitted. Documents: {len(documents)}")
+        print(f"Model2Vec index built. Docs: {len(documents)}, Vector Dim: {self.doc_embeddings.shape[1]}")
 
-    # ----------- QUERY -----------
     def query(self, query_text: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """
+        检索方法：给定查询文本，返回最相关的 Top-K 文档。
+        使用点积计算余弦相似度（因为向量已归一化）。
+
+        Args:
+            query_text (str): 查询字符串。
+            top_k (int): 返回结果数量。
+
+        Returns:
+            List[Tuple[str, float]]: [(doc_id, score), ...]
+        """
         if not self.is_fitted:
-            raise ValueError("Word2VecRetriever not fitted.")
+            raise ValueError("Index not built. Call fit() or load_index() first.")
 
-        tokens = self._preprocess_text(query_text)
-        query_vec = self._get_doc_vector(tokens).reshape(1, -1)
-        faiss.normalize_L2(query_vec)
+        # 1. 编码查询
+        # encode 返回的是 batch 的结果，所以取 [0]
+        query_vec = self.model.encode([query_text])[0]
 
-        scores, indices = self.index.search(query_vec, top_k)
+        # 2. 归一化查询向量
+        norm = np.linalg.norm(query_vec)
+        query_vec = query_vec / (norm + 1e-10)
 
-        result = []
-        for idx, score in zip(indices[0], scores[0]):
-            if idx < 0:
-                continue
-            result.append((self.doc_ids[idx], float(score)))
+        # 3. 计算相似度 (矩阵乘法: (1, dim) @ (dim, num_docs) -> (1, num_docs))
+        # 使用 dot product 计算余弦相似度
+        scores = np.dot(self.doc_embeddings, query_vec) * 100
 
-        return result
+        # 4. 获取 Top-K
+        # argsort 返回从小到大的索引，所以取最后 k 个并反转
+        top_indices = np.argsort(scores)[-top_k:][::-1]
 
-    # ----------- 保存 -----------
-    def save_index(self, dirpath: str):
-        os.makedirs(dirpath, exist_ok=True)
+        results = []
+        for idx in top_indices:
+            results.append((self.doc_ids[idx], float(scores[idx])))
 
-        print("Saving Word2Vec model...")
-        self.w2v_model.save(os.path.join(dirpath, "word2vec.model"))
+        return results
 
-        print("Saving doc ids...")
-        with open(os.path.join(dirpath, "doc_ids.pkl"), "wb") as f:
-            pickle.dump(self.doc_ids, f)
+    def save_index(self, filepath: str) -> None:
+        """序列化保存索引到磁盘"""
+        if not self.is_fitted:
+            raise ValueError("No index to save.")
 
-        print("Saving document frequency info...")
-        with open(os.path.join(dirpath, "term_df.pkl"), "wb") as f:
-            pickle.dump(self.term_df, f)
+        index_data = {
+            'doc_ids': self.doc_ids,
+            'doc_embeddings': self.doc_embeddings
+        }
 
-        print("Saving FAISS index...")
-        faiss.write_index(self.index, os.path.join(dirpath, "faiss.index"))
-
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        print(f"Saving index to {filepath}...")
+        with open(filepath, 'wb') as f:
+            pickle.dump(index_data, f)
         print("Index saved.")
 
-    # ----------- 加载 -----------
-    def load_index(self, dirpath: str):
-        print("Loading Word2Vec model...")
-        self.w2v_model = Word2Vec.load(os.path.join(dirpath, "word2vec.model"))
+    def load_index(self, filepath: str) -> None:
+        """从磁盘加载索引"""
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Index file not found: {filepath}")
 
-        print("Loading doc ids...")
-        with open(os.path.join(dirpath, "doc_ids.pkl"), "rb") as f:
-            self.doc_ids = pickle.load(f)
+        print(f"Loading index from {filepath}...")
+        with open(filepath, 'rb') as f:
+            index_data = pickle.load(f)
 
-        print("Loading DF info...")
-        with open(os.path.join(dirpath, "term_df.pkl"), "rb") as f:
-            self.term_df = pickle.load(f)
-
-        print("Loading FAISS index...")
-        self.index = faiss.read_index(os.path.join(dirpath, "faiss.index"))
+        self.doc_ids = index_data['doc_ids']
+        self.doc_embeddings = index_data['doc_embeddings']
 
         self.is_fitted = True
-        print("Index loaded successfully.")
+        print(f"Index loaded. Shape: {self.doc_embeddings.shape}")
 
 
 def main():
-    data_loader = HQSmallDataLoader("./data")
+    """
+    主程序：
+    1. 初始化 DataLoader 和 Model2VecRetriever。
+    2. 加载或重新构建向量索引。
+    3. 加载测试集。
+    4. 批量检索并保存结果。
+    """
+    data_loader = HQSmallDataLoader(config.BASE_DATA_DIR)
+    retriever = Model2VecRetriever(model_name=config.MODEL2VEC_MODEL_NAME)
 
-    collection_path = "./COMP5423-25Fall-HQ-small/collection.jsonl"
-    index_dir = "./data/w2v_index"
-
-    retriever = Word2VecRetriever(vector_dim=200)
-
-    if os.path.exists(f"{index_dir}/faiss.index"):
-        print("Loading existing index...")
-        retriever.load_index(index_dir)
+    # 1. 索引管理
+    if os.path.exists(config.MODEL2VEC_INDEX_PATH):
+        print(">>> Found existing index, loading...")
+        retriever.load_index(config.MODEL2VEC_INDEX_PATH)
     else:
-        print("Building new index...")
-        doc_ids, documents = data_loader.load_collection(collection_path)
-
+        print(">>> No index found, building from scratch...")
+        print(f"Loading collection from {config.COLLECTION_PATH}...")
+        doc_ids, documents = data_loader.load_collection(config.COLLECTION_PATH)
         retriever.fit(documents, doc_ids)
-        retriever.save_index(index_dir)
+        retriever.save_index(config.MODEL2VEC_INDEX_PATH)
 
-    test_queries = [
-        "Which airport is located in Maine, Sacramento International Airport or Knox County Regional Airport?"
-    ]
-    for query in tqdm(test_queries, desc="Testing queries"):
-        print(f"\nQuery: {query}")
-        results = retriever.query(query, top_k=5)
+    # 2. 单条查询测试 (Sanity Check)
+    sample_query = "Which airport is located in Maine?"
+    print(f"\n>>> Sanity Check Query: {sample_query}")
+    results = retriever.query(sample_query, top_k=10)
+    print("Top 10 results:")
+    for i, (doc_id, score) in enumerate(results, 1):
+        print(f"  {i}. DocID: {doc_id}, Score: {score:.4f}")
 
-        print("Results:")
-        for i, (doc_id, score) in enumerate(results, 1):
-            print(f"  {i}. DocID: {doc_id}, Score: {score:.4f}")
+    # 3. 批量处理测试集
+    print(f"\n>>> Batch Processing Test Set from {config.VALIDATION_SET_PATH}...")
+    test_queries_data = data_loader.load_test_set(config.VALIDATION_SET_PATH)
+
+    batch_results = []
+    for query_item in tqdm(test_queries_data, desc="Retrieving"):
+        query_id = query_item["id"]
+        query_text = query_item["text"]
+
+        # 执行检索
+        results = retriever.query(query_text, top_k=10)
+
+        # 格式化输出
+        batch_results.append({
+            "id": query_id,
+            "question": query_text,
+            "retrieved_docs": [[doc_id, float(score)] for doc_id, score in results]
+        })
+
+    # 4. 保存预测结果
+    print(f"Saving predictions to {config.MODEL2VEC_OUTPUT_PATH}...")
+    with open(config.MODEL2VEC_OUTPUT_PATH, 'w', encoding='utf-8') as f:
+        for result in tqdm(batch_results, desc="Writing file"):
+            f.write(json.dumps(result, ensure_ascii=False) + '\n')
+
+    print(">>> Done.")
 
 
 if __name__ == "__main__":

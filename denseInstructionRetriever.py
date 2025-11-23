@@ -2,157 +2,202 @@ import json
 import os
 import pickle
 from typing import List, Tuple
+
 import faiss
 import numpy as np
 import requests
 from tqdm import tqdm
+
+import config
 from HQSmallDataLoader import HQSmallDataLoader
 
-# ==================== 配置区 ====================
-API_URL = "https://api.siliconflow.cn/v1/embeddings"
-API_KEY = os.environ.get('SILICONFLOW_API_KEY')          # ←←← 请设置你的真实 key
-if not API_KEY:
-    raise ValueError("请设置环境变量 SILICONFLOW_API_KEY")
-
-# 推荐使用 Qwen3-Embedding-8B（目前 SiliconFlow 已支持）
-MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"   # 或者 "Qwen/Qwen3-Embedding-0.6B"（更轻量）
-
-BATCH_SIZE = 256          # SiliconFlow Qwen3-Embedding QPS 较高，可适当调大
-VECTOR_DIM = 1024        # Qwen3-Embedding-8B 维度是 4096（0.6B 是 1024，根据实际模型调整）
-INDEX_DIR = "./data/qwen3_index"
-COLLECTION_PATH = "./COMP5423-25Fall-HQ-small/collection.jsonl"
-
-# Qwen3-Embedding 官方推荐的 instruction（必须加，否则效果大幅下降）
-QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
-DOCUMENT_INSTRUCTION = ""   # 文档侧不需要加 instruction（官方推荐空字符串）
-
-# ================================================
 
 class Qwen3Retriever:
     """
-    基于 Qwen3-Embedding（Instruction-tuned） 的 Dense Retriever
-    使用 SiliconFlow 在线 embedding 接口 + FAISS 内积检索
+    基于 Qwen3-Embedding (Large) 的稠密检索器。
+    特点：
+    1. 高维向量 (4096维)。
+    2. 需要区分 Query 和 Document 的 Prompt 指令。
     """
+
     def __init__(self):
         self.doc_ids: List[str] = []
         self.documents: List[str] = []
         self.index: faiss.IndexFlatIP = None
         self.is_fitted = False
 
-    # ----------- 调用 SiliconFlow Embedding API（支持 instruction）-----------
-    def _get_embeddings(self, texts: List[str], is_query: bool = False) -> np.ndarray:
-        all_embeddings = []
-        instruction = QUERY_INSTRUCTION if is_query else DOCUMENT_INSTRUCTION
+    def _get_embedding(self, text: str, is_query: bool = False) -> np.ndarray:
+        """
+        核心工具方法：调用 Ollama 接口获取单个文本的 L2 归一化向量。
+        关键点：根据 is_query 添加不同的 Instruction 前缀。
+        """
+        # 根据 Qwen 文档，Query 和 Doc 通常需要不同的指令前缀
+        instruction = config.QWEN_QUERY_INSTRUCTION if is_query else config.QWEN_DOC_INSTRUCTION
 
-        for i in tqdm(range(0, len(texts), BATCH_SIZE), desc="Embedding batch"):
-            batch = texts[i:i + BATCH_SIZE]
+        full_prompt = instruction + text
+        payload = {
+            "model": config.QWEN_MODEL_NAME,
+            "prompt": full_prompt
+        }
+        try:
+            resp = requests.post(config.OLLAMA_API_URL, json=payload, timeout=120)
+            resp.raise_for_status()
 
-            # 按官方要求给每条文本加 instruction
-            input_texts = [instruction + text for text in batch]
+            emb = resp.json()["embedding"]
 
-            payload = {
-                "model": MODEL_NAME,
-                "input": input_texts,
-                "encoding_format": "float"
-            }
-            headers = {
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
-            }
-            try:
-                resp = requests.post(API_URL, headers=headers, json=payload, timeout=120)
-                resp.raise_for_status()
-                data = resp.json()
-                embeddings = [item["embedding"] for item in data["data"]]
-                all_embeddings.extend(embeddings)
-            except Exception as e:
-                print(f"Embedding request failed: {e}")
-                print("Response:", resp.text if 'resp' in locals() else "None")
-                raise
+            # 维度检查
+            if len(emb) != config.QWEN_VECTOR_DIM:
+                # 仅警告，有些量化版本可能会改变维度，但通常不会
+                pass
 
-        embeddings_np = np.array(all_embeddings, dtype=np.float32)
-        # Qwen3-Embedding 官方推荐 L2 归一化后使用内积（等价于余弦）
-        faiss.normalize_L2(embeddings_np)
-        return embeddings_np
+            # 转换为 numpy 数组 (dtype=np.float32)，注意外部列表是必须的，以保持 (1 x Dim) 形状
+            embedding_np = np.array([emb], dtype=np.float32)
 
-    # ----------- FIT：构建索引 -----------
+            # 归一化以适配余弦相似度检索
+            faiss.normalize_L2(embedding_np)
+
+            # 返回形状为 (1 x Dim) 的数组
+            return embedding_np
+
+        except Exception as e:
+            print(f"Ollama embedding error for text segment: {text[:30]}...")
+            print(f"Error: {e}")
+            raise
+
     def fit(self, documents: List[str], doc_ids: List[str] = None):
+        """
+        构建索引：对文档库进行 Embedding 并存入 FAISS。
+        """
         self.documents = documents
         self.doc_ids = doc_ids if doc_ids else [str(i) for i in range(len(documents))]
 
-        print(f"Total documents: {len(documents)}，开始获取 Qwen3 向量（文档侧）...")
-        doc_vectors = self._get_embeddings(documents, is_query=False)
+        print(f"Total documents: {len(documents)}. Generating Qwen3 embeddings...")
+
+        doc_vectors = []
+        # 注意：Document 侧通常不需要特殊指令，或使用空指令 (is_query=False)
+        for doc in tqdm(documents, desc="Vectorizing Documents"):
+            try:
+                # 获取单个文档向量 (shape: 1 x Dim) 并追加到列表中
+                vector = self._get_embedding(doc, is_query=False)
+                doc_vectors.append(vector)
+            except Exception:
+                # 遇到错误时停止处理
+                raise
+
+        # 将所有文档向量堆叠成一个 NumPy 数组 (shape: N x Dim)
+        doc_vectors_np = np.vstack(doc_vectors)
 
         print("Building FAISS IndexFlatIP...")
-        self.index = faiss.IndexFlatIP(VECTOR_DIM)
-        self.index.add(doc_vectors)
-        self.is_fitted = True
-        print("Qwen3 Retriever fitted successfully！")
+        self.index = faiss.IndexFlatIP(config.QWEN_VECTOR_DIM)
+        self.index.add(doc_vectors_np)
 
-    # ----------- QUERY -----------
+        self.is_fitted = True
+        print("Qwen3 Retriever fitted successfully!")
+
     def query(self, query_text: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """
+        检索方法：对查询进行 Embedding (带指令) 并搜索。
+        """
         if not self.is_fitted:
             raise ValueError("Qwen3Retriever not fitted yet.")
 
-        print(f"Query: {query_text}")
-        query_vec = self._get_embeddings([query_text], is_query=True)  # 注意这里加 query instruction
+        query_vec = self._get_embedding(query_text, is_query=True)
 
-        scores, indices = self.index.search(query_vec, top_k + 5)  # 多取几个防止过滤
+        # 搜索 Top-K
+        scores, indices = self.index.search(query_vec, top_k)
+
         results = []
-        for idx, score in zip(indices[0], scores[0]):
+        for idx, score in zip(indices[0], scores[0] * 100):
             if idx == -1:
                 continue
             results.append((self.doc_ids[idx], float(score)))
-        return results[:top_k]
+        return results
 
-    # ----------- 保存索引 -----------
-    def save_index(self, dirpath: str = INDEX_DIR):
+    def save_index(self, dirpath: str):
+        """保存模型和元数据"""
         os.makedirs(dirpath, exist_ok=True)
+
+        print("Saving meta data...")
         with open(os.path.join(dirpath, "doc_ids.pkl"), "wb") as f:
             pickle.dump(self.doc_ids, f)
+
+        print("Saving FAISS index...")
         faiss.write_index(self.index, os.path.join(dirpath, "faiss.index"))
+
+        # 可选：保存原文以便调试
         with open(os.path.join(dirpath, "documents.jsonl"), "w", encoding="utf-8") as f:
             for doc_id, text in zip(self.doc_ids, self.documents):
                 f.write(json.dumps({"id": doc_id, "text": text}, ensure_ascii=False) + "\n")
+
         print(f"Index saved to {dirpath}")
 
-    # ----------- 加载索引 -----------
-    def load_index(self, dirpath: str = INDEX_DIR):
-        with open(os.path.join(dirpath, "doc_ids.pkl"), "rb") as f:
+    def load_index(self, dirpath: str):
+        """加载模型和元数据"""
+        ids_path = os.path.join(dirpath, "doc_ids.pkl")
+        idx_path = os.path.join(dirpath, "faiss.index")
+
+        if not (os.path.exists(ids_path) and os.path.exists(idx_path)):
+            raise FileNotFoundError(f"Index files not found in {dirpath}")
+
+        with open(ids_path, "rb") as f:
             self.doc_ids = pickle.load(f)
-        self.index = faiss.read_index(os.path.join(dirpath, "faiss.index"))
+
+        self.index = faiss.read_index(idx_path)
         self.is_fitted = True
-        print(f"Index loaded from {dirpath}，documents count: {len(self.doc_ids)}")
+        print(f"Index loaded from {dirpath}, documents count: {len(self.doc_ids)}")
 
 
 def main():
-    data_loader = HQSmallDataLoader("./data")
-    index_dir = INDEX_DIR
+    """
+    主程序：Qwen3 检索器的构建、加载与批量测试。
+    """
+    data_loader = HQSmallDataLoader(config.BASE_DATA_DIR)
     retriever = Qwen3Retriever()
 
-    if os.path.exists(f"{index_dir}/faiss.index"):
-        print("Found existing Qwen3 index，loading...")
-        retriever.load_index(index_dir)
+    # 1. 索引管理
+    index_file_check = os.path.join(config.QWEN_INDEX_DIR, "faiss.index")
+    if os.path.exists(index_file_check):
+        print(">>> Found existing Qwen3 index, loading...")
+        retriever.load_index(config.QWEN_INDEX_DIR)
     else:
-        print("No index found，building new Qwen3 index...")
-        doc_ids, docs = data_loader.load_collection(COLLECTION_PATH)
-        retriever.fit(docs, doc_ids)
-        retriever.save_index(index_dir)
+        print(">>> No index found, building from scratch...")
+        doc_ids, documents = data_loader.load_collection(config.COLLECTION_PATH)
+        retriever.fit(documents, doc_ids)
+        retriever.save_index(config.QWEN_INDEX_DIR)
 
-    # 测试查询（中英文都支持）
-    test_queries = [
-        "Which airport is located in Maine, Sacramento International Airport or Knox County Regional Airport?"
-    ]
+    # 2. 单条测试
+    sample_query = "Which airport is located in Maine, Sacramento International Airport or Knox County Regional Airport?"
+    print(f"\n>>> Sanity Check Query: {sample_query}")
+    results = retriever.query(sample_query, top_k=10)
+    print("Top 10 results:")
+    for i, (doc_id, score) in enumerate(results, 1):
+        print(f"  {i}. DocID: {doc_id}, Score: {score:.4f}")
 
-    for q in test_queries:
-        print("\n" + "=" * 80)
-        print(f"Query: {q}")
-        results = retriever.query(q, top_k=5)
-        print("Top-5 Results:")
-        for rank, (doc_id, score) in enumerate(results, 1):
-            # 可选：打印文档内容便于调试
-            # doc_text = next((d for d in retriever.documents if retriever.doc_ids[retriever.documents.index(d)] == doc_id), "")
-            print(f" {rank:>2}. [DocID: {doc_id}] Score: {score:.4f}")
+    # 3. 批量处理测试集 (Test Set)
+    print(f"\n>>> Batch Processing Test Set from {config.VALIDATION_SET_PATH}...")
+    test_queries_data = data_loader.load_test_set(config.VALIDATION_SET_PATH)
+
+    batch_results = []
+    for query_item in tqdm(test_queries_data, desc="Retrieving"):
+        query_id = query_item["id"]
+        query_text = query_item["text"]
+
+        results = retriever.query(query_text, top_k=10)
+
+        batch_results.append({
+            "id": query_id,
+            "question": query_text,
+            "retrieved_docs": [[doc_id, float(score)] for doc_id, score in results]
+        })
+
+    # 4. 保存
+    print(f"Saving predictions to {config.QWEN_OUTPUT_PATH}...")
+    with open(config.QWEN_OUTPUT_PATH, 'w', encoding='utf-8') as f:
+        for result in tqdm(batch_results, desc="Writing file"):
+            f.write(json.dumps(result, ensure_ascii=False) + '\n')
+
+    print(">>> Done.")
+
 
 if __name__ == "__main__":
     main()
