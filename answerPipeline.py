@@ -1,5 +1,6 @@
 import json
 import requests
+import re
 import config  # 假设 config.py 存在，包含 BASE_DATA_DIR, SF_API_KEY 等配置
 from BGEReranker import BGEReranker  # BGE 重排序器模块
 from BM25Retriever import BM25Retriever  # BM25 检索器模块
@@ -11,8 +12,77 @@ from prompts import DECOMPOSITION_PROMPT, RELEVANCE_CHECK_PROMPT, QUERY_REWRITE_
     SELF_CHECK_PROMPT, SYNTHESIZE_ANSWERS_PROMPT  # 导入预定义的提示模板
 
 
+# 函数：清理和解析 JSON 响应
+def clean_and_parse_json_response(response_text, step_name=""):
+    """
+    清理响应文本中的 JSON 标记并解析为字典。
+    参数:
+    response_text (str): 包含 JSON 的响应文本
+    step_name (str): 步骤名称，用于日志记录
+    返回:
+    dict: 解析后的 JSON 字典
+    """
+    print(f"🧹 Cleaning JSON response for {step_name}...")
+    print(f"📥 Raw response: {response_text}")
+
+    # 尝试直接解析
+    try:
+        result = json.loads(response_text)
+        print(f"   ✅ Direct JSON parsing successful")
+        return result
+    except json.JSONDecodeError:
+        print(f"   ⚠️ Direct parsing failed, attempting to extract JSON from markdown code blocks")
+        pass
+
+    # 清理常见的 JSON 标记
+    cleaned_text = response_text.strip()
+
+    # 移除 ```json 和 ``` 标记
+    cleaned_text = re.sub(r'^```json\s*', '', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'```\s*$', '', cleaned_text)
+
+    # 移除其他可能的代码块标记
+    cleaned_text = re.sub(r'^```\s*', '', cleaned_text)
+    cleaned_text = re.sub(r'```\s*$', '', cleaned_text)
+
+    # 移除开头的 "json" 字样
+    cleaned_text = re.sub(r'^json\s*', '', cleaned_text, flags=re.IGNORECASE)
+
+    cleaned_text = cleaned_text.strip()
+    print(f"   🔧 Cleaned text: {cleaned_text}")
+
+    # 尝试解析清理后的文本
+    try:
+        result = json.loads(cleaned_text)
+        print(f"   ✅ Cleaned JSON parsing successful")
+        return result
+    except json.JSONDecodeError as e:
+        print(f"   ❌ Failed to parse JSON after cleaning: {e}")
+        # 如果还是失败，尝试更宽松的提取方法
+        try:
+            # 查找第一个 { 和最后一个 }
+            start_idx = cleaned_text.find('{')
+            end_idx = cleaned_text.rfind('}') + 1
+            if start_idx != -1 and end_idx != 0:
+                json_str = cleaned_text[start_idx:end_idx]
+                result = json.loads(json_str)
+                print(f"   ✅ Extracted JSON parsing successful")
+                return result
+        except Exception as e2:
+            print(f"   ❌ All JSON parsing attempts failed: {e2}")
+
+    # 如果所有解析都失败，返回默认结构
+    default_result = {
+        "is_relevant": False,
+        "reason": "JSON parsing failed",
+        "suggested_rewrite": ""
+    }
+    print(f"   ⚠️ Returning default result due to parsing failure")
+    return default_result
+
+
 # 函数：调用 SiliconFlow API 来生成 LLM 响应
-def call_llm(prompt, max_tokens=512, temperature=0.7, step_name=""):
+def call_llm(prompt, max_tokens=512, temperature=0.7, step_name="", expect_json=False):
     """
     调用 SiliconFlow API 来处理给定的提示。
     参数:
@@ -20,14 +90,14 @@ def call_llm(prompt, max_tokens=512, temperature=0.7, step_name=""):
     max_tokens (int): 最大生成的 token 数量，默认 512。
     temperature (float): 生成的温度参数，默认 0.7。
     step_name (str): 当前步骤名称，用于日志记录。
+    expect_json (bool): 是否期望返回 JSON 格式，默认 False。
     返回:
     str: API 返回的响应内容。
     异常:
     如果 API 调用失败，抛出异常。
     """
-    print(f"\n{'=' * 80}")
+    print(f"{'-' * 80}")
     print(f"🤖 LLM CALL - {step_name}")
-    print(f"{'=' * 80}")
     print(f"📤 PROMPT SENT:\n{prompt}")
     print(f"{'-' * 80}")
 
@@ -48,7 +118,12 @@ def call_llm(prompt, max_tokens=512, temperature=0.7, step_name=""):
         result = response.json()["choices"][0]["message"]["content"].strip()
         print(f"📥 RESPONSE RECEIVED:\n{result}")
         print(f"{'=' * 80}")
-        return result
+
+        # 如果期望 JSON 格式，进行清理和解析
+        if expect_json:
+            return clean_and_parse_json_response(result, step_name)
+        else:
+            return result
     else:
         error_msg = f"API call failed: {response.text}"
         print(f"❌ ERROR: {error_msg}")
@@ -102,7 +177,7 @@ def retrieve_documents(query, bm25_retriever, bge_retriever, bge_reranker, doc_i
     返回:
     tuple: 包含检索到的文档文本列表和文档 ID 列表。
     """
-    print(f"\n🔍 RETRIEVING DOCUMENTS FOR QUERY: '{query}'")
+    print(f"🔍 RETRIEVING DOCUMENTS FOR QUERY: '{query}'")
     print(f"Retrieval top_k: {retrieval_top_k}, Rerank top_k: {rerank_top_k}")
 
     results = hybrid_retrieve_and_rerank(
@@ -134,25 +209,25 @@ def rag_pipeline(query):
     返回:
     str: 最终生成的答案。
     """
-    print(f"\n🎯 STARTING RAG PIPELINE FOR QUERY: '{query}'")
-    print("=" * 100)
+    print(f"🎯 STARTING RAG PIPELINE FOR QUERY: '{query}'")
 
     bm25_retriever, bge_retriever, qwen3_retriever, bge_reranker, doc_id_to_text = initialize_retrievers()
 
     # 步骤 1: 查询分解
-    print(f"\n📝 STEP 1: QUERY DECOMPOSITION")
+    print("=" * 100)
+    print(f"📝 STEP 1: QUERY DECOMPOSITION")
     print(f"Original query: '{query}'")
 
     decomp_prompt = DECOMPOSITION_PROMPT.format(query=query)
-    decomp_response = call_llm(decomp_prompt, step_name="QUERY DECOMPOSITION")
+    decomp_response = call_llm(decomp_prompt, step_name="QUERY DECOMPOSITION", expect_json=True)
 
-    try:
-        decomp_json = json.loads(decomp_response)
-        needs_decomp = decomp_json["needs_decomposition"]
-        sub_queries = decomp_json["sub_queries"]
+    # 现在 decomp_response 已经是解析后的字典
+    if isinstance(decomp_response, dict):
+        needs_decomp = decomp_response.get("needs_decomposition", False)
+        sub_queries = decomp_response.get("sub_queries", [])
         print(f"✅ Decomposition result: needs_decomposition={needs_decomp}, sub_queries={sub_queries}")
-    except Exception as e:
-        print(f"❌ Failed to parse decomposition response: {e}")
+    else:
+        print(f"❌ Unexpected response type for decomposition: {type(decomp_response)}")
         needs_decomp = False
         sub_queries = []
 
@@ -162,14 +237,15 @@ def rag_pipeline(query):
     sub_answers = []
 
     for i, q in enumerate(queries):
-        print(f"\n🔄 PROCESSING SUB-QUERY {i + 1}/{len(queries)}: '{q}'")
+        print("=" * 100)
+        print(f"🔄 PROCESSING SUB-QUERY {i + 1}/{len(queries)}: '{q}'")
 
         current_query = q
         max_retries = 3
         is_relevant = False
 
         for attempt in range(max_retries):
-            print(f"\n   🔎 ATTEMPT {attempt + 1}/{max_retries}")
+            print(f"🔎 ATTEMPT {attempt + 1}/{max_retries}")
             print(f"   Current query: '{current_query}'")
 
             # 检索文档
@@ -178,22 +254,23 @@ def rag_pipeline(query):
             documents_str = "\n".join([f"Doc {i + 1}: {text}" for i, text in enumerate(doc_texts)])
 
             # 步骤 2: 相关性检查
-            print(f"\n   📊 STEP 2.{attempt + 1}: RELEVANCE CHECK")
+            print("=" * 100)
+            print(f"📊 STEP 2.{attempt + 1}: RELEVANCE CHECK")
             rel_prompt = RELEVANCE_CHECK_PROMPT.format(query=current_query, documents=documents_str)
-            rel_response = call_llm(rel_prompt, step_name=f"RELEVANCE CHECK (Attempt {attempt + 1})")
+            rel_response = call_llm(rel_prompt, step_name=f"RELEVANCE CHECK (Attempt {attempt + 1})", expect_json=True)
 
-            try:
-                rel_json = json.loads(rel_response)
-                is_relevant = rel_json["is_relevant"]
-                reason = rel_json["reason"]
-                suggested_rewrite = rel_json["suggested_rewrite"]
+            # 现在 rel_response 已经是解析后的字典
+            if isinstance(rel_response, dict):
+                is_relevant = rel_response.get("is_relevant", False)
+                reason = rel_response.get("reason", "")
+                suggested_rewrite = rel_response.get("suggested_rewrite", "")
                 print(f"   ✅ Relevance check result: is_relevant={is_relevant}, reason={reason}")
                 if suggested_rewrite:
                     print(f"   💡 Suggested rewrite: {suggested_rewrite}")
-            except Exception as e:
-                print(f"   ❌ Failed to parse relevance check response: {e}")
+            else:
+                print(f"   ❌ Unexpected response type for relevance check: {type(rel_response)}")
                 is_relevant = False
-                reason = "Parsing error"
+                reason = "Unexpected response type"
                 suggested_rewrite = ""
 
             if is_relevant:
@@ -213,47 +290,50 @@ def rag_pipeline(query):
             continue
 
         # 步骤 3: 生成答案
-        print(f"\n   📝 STEP 3: GENERATE ANSWER")
+        print("=" * 100)
+        print(f"📝 STEP 3: GENERATE ANSWER")
         context = "\n\n".join(doc_texts)
         gen_prompt = GENERATE_ANSWER_PROMPT.format(query=current_query, context=context)
         gen_response = call_llm(gen_prompt, step_name="GENERATE ANSWER")
 
         if "\nEvidence: " in gen_response:
             answer, evidence = gen_response.split("\nEvidence: ", 1)
-            print(f"   ✅ Answer generated with evidence")
-            print(f"   💡 Answer: {answer}")
-            print(f"   📚 Evidence: {evidence[:200]}...")
+            print(f"✅ Answer generated with evidence")
+            print(f"💡 Answer: {answer}")
+            print(f"📚 Evidence: {evidence[:200]}...")
         else:
             answer = gen_response
             evidence = ""
-            print(f"   ✅ Answer generated (no evidence separated)")
-            print(f"   💡 Answer: {answer}")
+            print(f"✅ Answer generated (no evidence separated)")
+            print(f"💡 Answer: {answer}")
 
         # 自检
-        print(f"\n   ✅ STEP 4: SELF-CHECK")
+        print("=" * 100)
+        print(f"✅ STEP 4: SELF-CHECK")
         self_check_prompt = SELF_CHECK_PROMPT.format(answer=answer, documents=documents_str)
-        self_check_response = call_llm(self_check_prompt, step_name="SELF-CHECK")
+        self_check_response = call_llm(self_check_prompt, step_name="SELF-CHECK", expect_json=True)
 
-        try:
-            self_check_json = json.loads(self_check_response)
-            is_valid = self_check_json["is_valid"]
-            issues = self_check_json["issues"]
-            revised_answer = self_check_json["revised_answer"]
-            print(f"   🔍 Self-check result: is_valid={is_valid}, issues={issues}")
+        # 现在 self_check_response 已经是解析后的字典
+        if isinstance(self_check_response, dict):
+            is_valid = self_check_response.get("is_valid", False)
+            issues = self_check_response.get("issues", "")
+            revised_answer = self_check_response.get("revised_answer", "")
+            print(f"🔍 Self-check result: is_valid={is_valid}, issues={issues}")
             if revised_answer:
-                print(f"   📝 Revised answer: {revised_answer}")
-        except Exception as e:
-            print(f"   ❌ Failed to parse self-check response: {e}")
+                print(f"📝 Revised answer: {revised_answer}")
+        else:
+            print(f"❌ Unexpected response type for self-check: {type(self_check_response)}")
             is_valid = False
-            issues = "Parsing error"
+            issues = "Unexpected response type"
             revised_answer = ""
 
         final_sub_answer = revised_answer if not is_valid else answer
         sub_answers.append(final_sub_answer)
-        print(f"   ✅ Final sub-answer: {final_sub_answer}")
+        print(f"✅ Final sub-answer: {final_sub_answer}")
 
     # 如果分解了，则合成答案
-    print(f"\n🎯 FINAL STEP: SYNTHESIZE ANSWERS")
+    print("=" * 100)
+    print(f"🎯 FINAL STEP: SYNTHESIZE ANSWERS")
     if needs_decomp and len(sub_answers) > 1:
         print(f"📦 Synthesizing {len(sub_answers)} sub-answers into final answer")
         sub_answers_str = "\n".join([f"Sub-answer {i + 1}: {answer}" for i, answer in enumerate(sub_answers)])
@@ -273,7 +353,7 @@ if __name__ == "__main__":
     print("🚀 STARTING RAG PIPELINE DEMO")
     print("=" * 100)
     answer = rag_pipeline(sample_query)
-    print(f"\n🎉 FINAL RESULT")
+    print(f"🎉 FINAL RESULT")
     print("=" * 100)
     print(f"📝 Original Query: {sample_query}")
     print(f"💡 Final Answer: {answer}")
