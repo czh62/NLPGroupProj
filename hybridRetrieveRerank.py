@@ -118,7 +118,7 @@ def main_hybrid():
     # 2. 加载测试集
     test_queries_data = data_loader.load_test_set(config.VALIDATION_SET_PATH)
 
-    sample_query = "Which airport is located in Maine, Sacramento International Airport or Knox County Regional Airport?"
+    sample_query = "Is Sacramento International Airport located in Maine?"
     print(f"\n>>> Sanity Check Query: {sample_query}")
     results = hybrid_retrieve_and_rerank(query=sample_query,
                                          first_retriever=bm25_retriever,

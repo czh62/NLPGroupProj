@@ -1,84 +1,105 @@
-# Prompt for determining if a query needs decomposition and generating sub-queries if necessary.
+# 1. 查询分解（Query Decomposition）
 DECOMPOSITION_PROMPT = """
-You are an expert query analyzer. Determine if the following query is complex and requires decomposition into sub-queries for better retrieval-augmented generation. Complex queries are multi-hop, involve multiple entities, or require reasoning across steps.
+你是一个专业的查询分解专家。请判断用户的问题是否复杂，是否需要拆分成多个相互独立的子问题来分别检索和回答。
 
-Query: {query}
+规则：
+- 如果问题是简单的事实性问题，直接回答 needs_decomposition = false
+- 如果问题包含多个实体、多个条件、比较、因果关系等，建议拆分成多个子问题
+- 每个子问题必须独立、可单独检索
+- 子问题数量建议 2~4 个
 
-If the query is simple (single-hop, direct fact), respond with: "No decomposition needed."
+用户问题：{query}
 
-If decomposition is needed, list 2-4 sub-queries that break it down logically. Each sub-query should be self-contained and answerable independently. Output in JSON format:
+请以严格的 JSON 格式回复，字段如下：
 {{
-  "needs_decomposition": true,
-  "sub_queries": ["sub_query1", "sub_query2", ...]
+    "needs_decomposition": true/false,
+    "sub_queries": ["子问题1", "子问题2", ...]
 }}
-If no decomposition: 
-{{
-  "needs_decomposition": false,
-  "sub_queries": []
-}}
+
+只输出 JSON，不要有任何解释。
 """
 
-# Prompt for checking relevance of retrieved documents to the query.
-RELEVANCE_CHECK_PROMPT = """
-You are a relevance evaluator. Given the query and the retrieved documents, determine if the documents are relevant to answering the query. Relevant means the documents contain information directly related to the key elements of the query.
+# 2. 相关性判断 + 查询重写
+RELEVANCE_AND_REWRITE_PROMPT = """
+你是一个严谨的检索评估专家。现在有用户问题和一批检索到的文档片段，请完成以下两件事：
 
-Query: {query}
-Retrieved Documents:
+1. 判断当前检索到的文档整体是否足以回答用户问题
+2. 如果不足以回答，给出一个更精准、可提高召回率的改进查询，或者可以提供格外资料的查询，与原问题不可相同
+
+用户问题：
+{query}
+
+检索到的文档：
 {documents}
 
-Respond with JSON:
+请严格按照以下 JSON 格式回答：
+
 {{
-  "is_relevant": true/false,
-  "reason": "brief explanation",
-  "suggested_rewrite": "if not relevant, suggest a rewritten query, else empty string"
+    "is_relevant": true/false,
+    "reason": "简短说明原因（50字以内）",
+    "improved_query": "如果 is_relevant=false，必须给出改进后的查询；否则留空字符串"
 }}
+
+注意：
+- 只有当文档中明确包含答案或强相关信息时才返回 true
+- improved_query 必须是完整的、可直接用于下一轮检索的新问题
+- 只输出 JSON，无其他文字
 """
 
-# Prompt for rewriting the query if relevance check fails.
-QUERY_REWRITE_PROMPT = """
-You are a query rewriter. Rewrite the original query to improve retrieval results, based on the suggestion and previous failure reason. Make it more precise, add synonyms, or rephrase for clarity.
-
-Original Query: {original_query}
-Failure Reason: {reason}
-Suggested Rewrite: {suggested_rewrite}
-
-Output the rewritten query as plain text.
-"""
-
-# Prompt for generating an answer based on retrieved documents.
+# 3. 答案生成（核心 RAG 提示词）
 GENERATE_ANSWER_PROMPT = """
-You are a helpful assistant. Using ONLY the provided context from retrieved documents, answer the query accurately and concisely. If the context doesn't have enough information, say "Insufficient information in context."
+你是一个严谨、准确的问答助手。请根据以下提供的上下文资料，回答用户问题。
 
-Query: {query}
-Context:
+要求：
+1. 只能使用上下文中的信息作答，绝对不能编造未出现在上下文中的事实
+2. 如果上下文不足以回答，必须明确说“根据提供的资料无法确定”
+3. 回答要简洁、直接、完整
+4. 如果答案是选择题或比较题，直接给出最终结论
+
+用户问题：{query}
+
+上下文资料：
 {context}
 
-Output the answer in plain text, followed by a newline, then "Evidence: " and list the document IDs used.
+请直接给出答案，不要重复问题，不要加任何前缀解释。
 """
 
-# Prompt for self-checking the generated answer against the evidence.
+# 4. 答案自检（Self-Check）
 SELF_CHECK_PROMPT = """
-You are a fact-checker. Verify if the generated answer is fully supported by the provided evidence without hallucinations. Check for accuracy, consistency, and completeness.
+你是一个高质量答案审查专家。请检查下面的答案是否完全忠实于提供的文档，是否存在幻觉、遗漏或错误。
 
-Generated Answer: {answer}
-Evidence Documents:
+用户问题（供参考）：{query}
+答案：{answer}
+使用的文档：
 {documents}
 
-Respond with JSON:
+请严格按以下 JSON 格式评估：
+
 {{
-  "is_valid": true/false,
-  "issues": "list any issues or empty string",
-  "revised_answer": "if not valid, provide a revised answer, else empty string"
+    "is_valid": true/false,
+    "issues": "如果有问题，列出具体问题；否则写 'none'",
+    "revised_answer": "如果需要修正，给出修正后的完整答案；否则留空字符串"
 }}
+
+只输出 JSON，无其他内容。
 """
 
-# Prompt for synthesizing multiple sub-answers into a final answer.
+# 5. 多子答案合成（最终融合）
 SYNTHESIZE_ANSWERS_PROMPT = """
-You are a response synthesizer. Combine the following sub-answers into a coherent, complete final answer for the original query. Ensure logical flow and no contradictions.
+你是一个高级答案整合专家。用户提出了一个复杂问题，我们已经将其拆解为多个子问题，并分别得到了答案。
 
-Original Query: {original_query}
-Sub-Answers:
-{sub_answers}
+现在请你综合所有子答案，给出对原问题的最终、流畅、准确的完整回答。
 
-Output the final answer in plain text.
+原问题：{original_query}
+
+各子问题及其答案如下：
+{sub_answers_with_queries}
+
+要求：
+- 必须综合所有子答案，形成连贯的最终回答
+- 不要列出“子问题1、子问题2”，直接自然段落回答
+- 如有冲突，优先选择最可信的来源并说明
+- 保持答案简洁、逻辑清晰
+
+请直接输出最终答案，不要加任何标题或说明。
 """
