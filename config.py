@@ -1,7 +1,5 @@
 import os
 
-from numpy.random import SFC64
-
 # ==================== 路径配置 ====================
 # 基础数据目录
 BASE_DATA_DIR = "./data"
@@ -30,8 +28,12 @@ BGE_OUTPUT_PATH = os.path.join(BASE_DATA_DIR, "bge_test_prediction.jsonl")
 QWEN_INDEX_DIR = os.path.join(BASE_DATA_DIR, "qwen3_index")
 QWEN_OUTPUT_PATH = os.path.join(BASE_DATA_DIR, "qwen3_test_prediction.jsonl")
 
+# Multi vector
 MULTI_VECTOR_INDEX_DIR = os.path.join(BASE_DATA_DIR, "multi_vector_index")
 MULTI_VECTOR_OUTPUT_PATH = os.path.join(BASE_DATA_DIR, "multi_vector_results.jsonl")
+
+# Hybrid retrieve and rerank
+HYBRID_RETRIEVE_AND_RERANK_OUTPUT_PATH = os.path.join(BASE_DATA_DIR, "hybrid_retrieve_prediction.jsonl")
 
 # ==================== 算法参数配置 ====================
 # BM25 参数
@@ -47,6 +49,7 @@ MODEL2VEC_BATCH_SIZE = 256  # 批量编码的大小
 OLLAMA_API_URL = "http://localhost:11434/api/embeddings"
 SF_API_RERANK_URL = "https://api.siliconflow.cn/v1/rerank"
 SF_API_EMBEDDING_URL = "https://api.siliconflow.cn/v1/embeddings"
+SF_API_LLM_URL = "https://api.siliconflow.cn/v1/chat/completions"
 SF_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
 BATCH_SIZE = 32
 
@@ -62,3 +65,6 @@ SF_QWEN_MODEL_NAME = "Qwen/Qwen3-Embedding-8B"
 QWEN_VECTOR_DIM = 4096
 QWEN_QUERY_INSTRUCTION = "Generate a vector representation for this query to retrieve relevant documents: "
 QWEN_DOC_INSTRUCTION = ""
+
+# LLM模型配置
+SF_LLM_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"

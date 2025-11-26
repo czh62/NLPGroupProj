@@ -1,11 +1,10 @@
 import json
-import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
 
 from tqdm import tqdm
 
 import config
-import test
 from BGEReranker import BGEReranker
 from BM25Retriever import BM25Retriever
 from HQSmallDataLoader import HQSmallDataLoader
@@ -65,7 +64,7 @@ def hybrid_retrieve_and_rerank(
     # 3. 准备重排序候选集 (Candidate Generation)
     # 我们取出 RRF 排名靠前的文档送入 Reranker
     # 注意：Reranker 很慢，所以candidate_k 不要太大 (通常 50-100)
-    candidate_k = min(len(fused_results), retrieval_top_k)
+    candidate_k = min(len(fused_results), int(retrieval_top_k * 1.5))
     candidates = fused_results[:candidate_k]
 
     candidate_ids = [doc_id for doc_id, _ in candidates]
@@ -97,19 +96,18 @@ def main_hybrid():
     all_doc_ids, all_documents = data_loader.load_collection(config.COLLECTION_PATH)
     doc_id_to_text = dict(zip(all_doc_ids, all_documents))
 
-
     if getattr(config, "SF_API_KEY", None):
         print(f">>> Using SiliconFlow API")
-        reranker = BGEReranker(api_key=config.SF_API_KEY)
+        bge_reranker = BGEReranker(api_key=config.SF_API_KEY)
         bm25_retriever = BM25Retriever()
-        bge_retriever = BGERetriever(api_key=config.SF_API_KEY)
         qwen3_retriever = Qwen3Retriever(api_key=config.SF_API_KEY)
+        bge_retriever = BGERetriever(api_key=config.SF_API_KEY)
     else:
         print(f">>> Using Local Ollama")
-        reranker = BGEReranker()  # 第一次运行会自动下载模型
+        bge_reranker = BGEReranker()  # 第一次运行会自动下载模型
         bm25_retriever = BM25Retriever()
-        bge_retriever = BGERetriever()
         qwen3_retriever = Qwen3Retriever()
+        bge_retriever = BGERetriever()
 
     # 加载索引 (假设你已经按照之前的脚本生成了索引)
     print("Loading indices...")
@@ -120,14 +118,12 @@ def main_hybrid():
     # 2. 加载测试集
     test_queries_data = data_loader.load_test_set(config.VALIDATION_SET_PATH)
 
-    batch_results = []
-
     sample_query = "Which airport is located in Maine, Sacramento International Airport or Knox County Regional Airport?"
     print(f"\n>>> Sanity Check Query: {sample_query}")
     results = hybrid_retrieve_and_rerank(query=sample_query,
                                          first_retriever=bm25_retriever,
-                                         second_retriever=qwen3_retriever,
-                                         reranker=reranker,
+                                         second_retriever=bge_retriever,
+                                         reranker=bge_reranker,
                                          doc_id_to_text_map=doc_id_to_text,
                                          retrieval_top_k=50,  # 粗排召回数量
                                          rerank_top_k=10  # 最终输出数量
@@ -137,33 +133,42 @@ def main_hybrid():
         print(f"  {i}. DocID: {doc_id}, Score: {score:.4f}")
 
     # 3. 批量处理
-    print(">>> Starting Hybrid Retrieval + Reranking...")
-    for query_item in tqdm(test_queries_data, desc="Hybrid Pipeline"):
+    print(">>> Starting Hybrid Retrieval + Reranking with X threads...")
+
+    batch_results = []
+
+    def process_one_query(query_item):
+        """单个 query 的处理逻辑，用于在线程里执行"""
         query_id = query_item["id"]
         query_text = query_item["text"]
 
-        # 调用封装好的混合检索函数
-        # 策略: 两个检索器各取 Top-50 -> 融合 -> Reranker 精排前 50 -> 输出 Top 10
         final_top_docs = hybrid_retrieve_and_rerank(
             query=query_text,
             first_retriever=bm25_retriever,
-            second_retriever=qwen3_retriever,
-            reranker=reranker,
+            second_retriever=bge_retriever,
+            reranker=bge_reranker,
             doc_id_to_text_map=doc_id_to_text,
-            retrieval_top_k=100,  # 粗排召回数量
-            rerank_top_k=10  # 最终输出数量
+            retrieval_top_k=50,
+            rerank_top_k=10
         )
 
-        batch_results.append({
+        return {
             "id": query_id,
             "question": query_text,
             "retrieved_docs": [[doc_id, float(score)] for doc_id, score in final_top_docs]
-        })
+        }
+
+    # 使用 X 线程并发执行全部 query
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = [executor.submit(process_one_query, item) for item in test_queries_data]
+
+        # tqdm 进度条 + 多线程结果收集
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Hybrid Pipeline"):
+            batch_results.append(future.result())
 
     # 4. 保存结果
-    output_path = os.path.join(config.BASE_DATA_DIR, "hybrid_rerank_predictions.jsonl")
-    print(f"Saving hybrid results to {output_path}...")
-    with open(output_path, 'w', encoding='utf-8') as f:
+    print(f"Saving hybrid results to {config.HYBRID_RETRIEVE_AND_RERANK_OUTPUT_PATH}...")
+    with open(config.HYBRID_RETRIEVE_AND_RERANK_OUTPUT_PATH, 'w', encoding='utf-8') as f:
         for result in batch_results:
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
 
