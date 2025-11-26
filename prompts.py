@@ -1,105 +1,129 @@
-# 1. 查询分解（Query Decomposition）
 DECOMPOSITION_PROMPT = """
-你是一个专业的查询分解专家。请判断用户的问题是否复杂，是否需要拆分成多个相互独立的子问题来分别检索和回答。
+You are a professional query decomposition expert. Your task is to determine whether the user's question is complex enough to require decomposition into multiple sub-questions.
 
-规则：
-- 如果问题是简单的事实性问题，直接回答 needs_decomposition = false
-- 如果问题包含多个实体、多个条件、比较、因果关系等，建议拆分成多个子问题
-- 每个子问题必须独立、可单独检索
-- 子问题数量建议 2~4 个
+Rules:
+- If the question is simple, straightforward, or can be answered directly without additional breakdown, return needs_decomposition = false.
+- If the question involves multiple entities, multiple conditions, comparisons, causal reasoning, multi-step logic, or timeline analysis, it likely needs decomposition.
+- Only decompose when decomposition will improve retrieval or answer quality. Do NOT decompose simple or single-step questions.
+- Sub-questions must be complete, clear, and independently understandable. 
+- Sub-questions may be independent or dependent on earlier ones (use depends_on for dependent questions).
+- Recommended number of sub-queries: 2–10, with a maximum of 10.
 
-用户问题：{query}
+User question: {query}
 
-请以严格的 JSON 格式回复，字段如下：
+Respond strictly in JSON format (no additional explanations):
 {{
     "needs_decomposition": true/false,
-    "sub_queries": ["子问题1", "子问题2", ...]
+    "sub_queries": [
+        {{
+            "query": "Sub-question 1 (clear and self-contained)",
+            "id": "Q1",
+            "depends_on": []
+        }},
+        {{
+            "query": "Sub-question 2",
+            "id": "Q2",
+            "depends_on": ["Q1"]
+        }}
+    ]
+}}
+""".strip()
+
+
+REWRITE_SUBQUERIES_PROMPT = """
+You are a query optimization expert. Based on dependencies between sub-questions and previously obtained preceding answers, rewrite dependent sub-questions into complete, standalone queries that can be searched independently.
+
+Input:
+- Original complex question: {original_query}
+- All sub-questions list (including dependencies): {sub_queries_json}
+- Previously answered preceding answers (keyed by sub-query id): {previous_answers_json}
+
+Rewriting rules:
+1. Sub-questions with empty depends_on remain unchanged
+2. For sub-questions with dependencies, naturally incorporate the preceding answers into the query
+3. Rewritten queries must be concise, search-friendly, and preserve original intent
+
+Output strictly in the following JSON format (JSON only):
+{{
+    "rewritten_queries": [
+        {{
+            "original_id": "q1",
+            "original_query": "original sub-question text",
+            "rewritten_query": "rewritten standalone searchable query (same as original_query if no change needed)"
+        }}
+    ]
 }}
 
-只输出 JSON，不要有任何解释。
-"""
+Example:
+Original q2: "Who is its founder?", depends on q1, q1 answer is "OpenAI"
+→ rewritten_query = "Who is the founder of OpenAI?"
+""".strip()
 
-# 2. 相关性判断 + 查询重写
 RELEVANCE_AND_REWRITE_PROMPT = """
-你是一个严谨的检索评估专家。现在有用户问题和一批检索到的文档片段，请完成以下两件事：
+You are a rigorous retrieval evaluation expert. Given the user question and a batch of retrieved document snippets, complete two tasks:
 
-1. 判断当前检索到的文档整体是否足以回答用户问题
-2. 如果不足以回答，给出一个更精准、可提高召回率的改进查询，或者可以提供格外资料的查询，与原问题不可相同
+1. Determine whether all retrieved documents collectively are sufficient to answer the user question completely and accurately
+2. If insufficient, provide a more precise improved query that can increase recall (must include necessary context)
 
-用户问题：
-{query}
+User question: {query}
+Known preceding answer context (if any): {context_dependency}
+Retrieved document snippets (sorted by relevance): {documents}
 
-检索到的文档：
-{documents}
-
-请严格按照以下 JSON 格式回答：
-
+Respond strictly in the following JSON format (JSON only):
 {{
     "is_relevant": true/false,
-    "reason": "简短说明原因（50字以内）",
-    "improved_query": "如果 is_relevant=false，必须给出改进后的查询；否则留空字符串"
+    "reason": "Brief reason, keep under 50 words",
+    "improved_query": "",
+    "needs_context": true/false
 }}
+""".strip()
 
-注意：
-- 只有当文档中明确包含答案或强相关信息时才返回 true
-- improved_query 必须是完整的、可直接用于下一轮检索的新问题
-- 只输出 JSON，无其他文字
-"""
-
-# 3. 答案生成（核心 RAG 提示词）
 GENERATE_ANSWER_PROMPT = """
-你是一个严谨、准确的问答助手。请根据以下提供的上下文资料，回答用户问题。
+You are a rigorous and accurate Q&A assistant. Answer the user question based ONLY on the provided context materials. Never fabricate information not present in the context.
 
-要求：
-1. 只能使用上下文中的信息作答，绝对不能编造未出现在上下文中的事实
-2. 如果上下文不足以回答，必须明确说“根据提供的资料无法确定”
-3. 回答要简洁、直接、完整
-4. 如果答案是选择题或比较题，直接给出最终结论
+Requirements:
+1. Use only information from "previous answer context" and "current retrieval context"
+2. Answer must be concise, direct, complete, and logically coherent
+3. Output the answer content directly, without any prefix
 
-用户问题：{query}
+User question: {query}
+Previous answer context (answers to resolved dependency questions): {previous_answers}
+Current retrieval context (reliable information retrieved this time): {context}
 
-上下文资料：
-{context}
+Provide the answer directly:
+""".strip()
 
-请直接给出答案，不要重复问题，不要加任何前缀解释。
-"""
-
-# 4. 答案自检（Self-Check）
 SELF_CHECK_PROMPT = """
-你是一个高质量答案审查专家。请检查下面的答案是否完全忠实于提供的文档，是否存在幻觉、遗漏或错误。
+You are a high-quality answer review expert. Strictly check whether the given answer is completely faithful to the provided documents, and whether there is any hallucination, omission of key information, or factual error.
 
-用户问题（供参考）：{query}
-答案：{answer}
-使用的文档：
+User question (for reference only): {query}
+Answer to be checked: {answer}
+All document snippets used as basis for the answer:
 {documents}
 
-请严格按以下 JSON 格式评估：
-
+Output strictly in the following JSON format (JSON only):
 {{
     "is_valid": true/false,
-    "issues": "如果有问题，列出具体问题；否则写 'none'",
-    "revised_answer": "如果需要修正，给出修正后的完整答案；否则留空字符串"
+    "issues": "none" or brief description of problems,
+    "revised_answer": ""
 }}
+""".strip()
 
-只输出 JSON，无其他内容。
-"""
-
-# 5. 多子答案合成（最终融合）
 SYNTHESIZE_ANSWERS_PROMPT = """
-你是一个高级答案整合专家。用户提出了一个复杂问题，我们已经将其拆解为多个子问题，并分别得到了答案。
+You are an advanced answer synthesis expert. The user has asked a complex question, and the system has provided multiple sub-question answers as reference information.
 
-现在请你综合所有子答案，给出对原问题的最终、流畅、准确的完整回答。
+Your task is to produce a complete, natural, and coherent final answer that responds directly to the original question.
 
-原问题：{original_query}
+Original question: {original_query}
 
-各子问题及其答案如下：
-{sub_answers_with_queries}
+Reference information (answers to decomposed sub-questions):
+{sub_answers_with_dependencies}
 
-要求：
-- 必须综合所有子答案，形成连贯的最终回答
-- 不要列出“子问题1、子问题2”，直接自然段落回答
-- 如有冲突，优先选择最可信的来源并说明
-- 保持答案简洁、逻辑清晰
+Requirements:
+- Use the sub-question answers only as reference; do not mention or refer to the sub-questions in the final response
+- Provide only the final answer to the original question, without explaining the process or referencing the source information
+- Ensure the language is smooth, logically clear, and free from unnecessary repetition
+- Output only the final answer—no titles, explanations, or citation markers
 
-请直接输出最终答案，不要加任何标题或说明。
-"""
+Now generate the final answer:
+""".strip()
