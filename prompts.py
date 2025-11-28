@@ -1,29 +1,30 @@
 DECOMPOSITION_PROMPT = """
-You are a professional query decomposition expert. Your task is to determine whether the user's question is complex enough to require decomposition into multiple sub-questions.
+You are a professional query decomposition expert. Your ONLY job is to judge whether decomposition genuinely helps retrieval and final answer quality.
 
-Rules:
-- If the question is simple, straightforward, or can be answered directly without additional breakdown, return needs_decomposition = false.
-- If the question involves multiple entities, multiple conditions, comparisons, causal reasoning, multi-step logic, or timeline analysis, it likely needs decomposition.
-- Only decompose when decomposition will improve retrieval or answer quality. Do NOT decompose simple or single-step questions.
-- Sub-questions must be complete, clear, and independently understandable. 
-- Sub-questions may be independent or dependent on earlier ones (use depends_on for dependent questions).
-- Recommended number of sub-queries: 2–10, with a maximum of 10.
+Strict rules — violate any one and you fail:
+- Return needs_decomposition = false for ANY question that is simple, factual, single-entity, single-condition, or can be answered accurately with one search.
+- ONLY decompose when the question clearly contains ≥2 of the following traits:
+  • Multiple distinct entities that need separate lookups
+  • Explicit comparison between two or more things
+  • Causal reasoning (“why”, “how did X lead to Y”)
+  • Multi-hop logic requiring intermediate facts
+  • Timeline or sequence of events
+  • Combination of conditions that cannot be searched effectively in one query
+- NEVER decompose just because the question is long or has multiple sentences.
+- NEVER create sub-questions that are minor rephrasings or trivial variants.
+- Maximum 6 sub-questions, prefer 2–4 when decomposition is truly needed.
+- Each sub-question must be independently searchable and add unique value.
 
 User question: {query}
 
-Respond strictly in JSON format (no additional explanations):
+Respond strictly in JSON only, no explanations whatsoever:
 {{
     "needs_decomposition": true/false,
     "sub_queries": [
         {{
-            "query": "Sub-question 1 (clear and self-contained)",
+            "query": "Complete, self-contained sub-question",
             "id": "Q1",
             "depends_on": []
-        }},
-        {{
-            "query": "Sub-question 2",
-            "id": "Q2",
-            "depends_on": ["Q1"]
         }}
     ]
 }}
@@ -110,20 +111,21 @@ Output strictly in the following JSON format (JSON only):
 """.strip()
 
 SYNTHESIZE_ANSWERS_PROMPT = """
-You are an advanced answer synthesis expert. The user has asked a complex question, and the system has provided multiple sub-question answers as reference information.
-
-Your task is to produce a complete, natural, and coherent final answer that responds directly to the original question.
+You are an answer synthesis expert. Your task is to give a concise, natural final answer to the original user question using the provided sub-answers as hidden reference only.
 
 Original question: {original_query}
 
-Reference information (answers to decomposed sub-questions):
+Reference sub-answers (do NOT mention them or quote them directly):
 {sub_answers_with_dependencies}
 
-Requirements:
-- Use the sub-question answers only as reference; do not mention or refer to the sub-questions in the final response
-- Provide only the final answer to the original question, without explaining the process or referencing the source information
-- Ensure the language is smooth, logically clear, and free from unnecessary repetition
-- Output only the final answer—no titles, explanations, or citation markers
+CRITICAL RULES — follow exactly:
+- Answer the original question directly in 1–4 sentences (preferably 1–2).
+- Do NOT explain reasoning process.
+- Do NOT mention “sub-questions”, “first”, “second”, “according to source X”.
+- Do NOT repeat the question.
+- Do NOT add meta-commentary like “Based on the analysis…”.
+- Remove all redundancy and tracing of intermediate steps.
+- If the answer naturally fits in one short paragraph, use only that.
 
-Now generate the final answer:
+Output the final answer ONLY — no JSON, no titles, no markdown, nothing else.
 """.strip()

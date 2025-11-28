@@ -220,7 +220,7 @@ class MultiVectorRetriever:
 
         for parent_id, (score, _) in sorted_results[:top_k]:
             parent_content = self.parent_id_to_content.get(parent_id, "CONTENT NOT FOUND")
-            results.append((parent_id, parent_content, float(score)))
+            results.append((parent_id, float(score)))
 
         return results
 
@@ -298,7 +298,7 @@ def main():
     print(f"\n>>> Sanity Check Query: {sample_query}")
     results = retriever.query(sample_query, top_k=10)
     print("Top 10 results:")
-    for i, (doc_id, content, score) in enumerate(results, 1):
+    for i, (doc_id, score) in enumerate(results, 1):
         print(f"  {i}. DocID: {doc_id}, Score: {score:.4f}")
 
     # 3. 批量处理测试集 (Test Set)

@@ -4,13 +4,16 @@ import re
 import requests
 import streamlit as st
 
-# 本地模块
+# Local Modules
 import config
 from BGEReranker import BGEReranker
 from BM25Retriever import BM25Retriever
 from HQSmallDataLoader import HQSmallDataLoader
+from denseInstructionRetriever import Qwen3Retriever
 from denseRetriever import BGERetriever
 from hybridRetrieveRerank import hybrid_retrieve_and_rerank
+from model2vecRetriever import Model2VecRetriever
+from multivectorRetrieval import MultiVectorRetriever
 from prompts import (
     DECOMPOSITION_PROMPT, REWRITE_SUBQUERIES_PROMPT,
     RELEVANCE_AND_REWRITE_PROMPT, GENERATE_ANSWER_PROMPT,
@@ -19,7 +22,7 @@ from prompts import (
 
 
 # ==========================================
-# 纯净的 LLM 调用（不显示任何中间状态）
+# Pure LLM Call (No intermediate display)
 # ==========================================
 def call_llm(prompt, max_tokens=512, temperature=0.7, expect_json=False):
     headers = {
@@ -34,13 +37,13 @@ def call_llm(prompt, max_tokens=512, temperature=0.7, expect_json=False):
     }
     response = requests.post(config.SF_API_LLM_URL, headers=headers, json=data, timeout=180)
     if response.status_code != 200:
-        raise Exception(f"API 错误: {response.text}")
+        raise Exception(f"API Error: {response.text}")
 
     text = response.json()["choices"][0]["message"]["content"].strip()
     if not expect_json:
         return text
 
-    # JSON 清理解析
+    # JSON Cleaning and Parsing
     cleaned = re.sub(r'^```json\s*|\s*```$', '', text, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r'^json\s*', '', cleaned, flags=re.IGNORECASE)
     try:
@@ -57,44 +60,101 @@ def call_llm(prompt, max_tokens=512, temperature=0.7, expect_json=False):
 
 
 # ==========================================
-# 缓存检索器
+# Resource Loader (Unified Retriever Management)
 # ==========================================
 @st.cache_resource
-def get_retrievers():
+def get_resources():
+    # 1. Load Document Data
     loader = HQSmallDataLoader(config.BASE_DATA_DIR)
     ids, docs = loader.load_collection(config.COLLECTION_PATH)
     doc_map = dict(zip(ids, docs))
 
+    # 2. Initialize Reranker
     bge_reranker = BGEReranker(api_key=config.SF_API_KEY)
-    bm25 = BM25Retriever()
-    bge_ret = BGERetriever(api_key=config.SF_API_KEY)
 
-    bm25.load_index(config.BM25_INDEX_PATH)
-    bge_ret.load_index(config.BGE_INDEX_DIR)
+    # 3. Initialize Retrievers
+    retrievers = {}
 
-    return bm25, bge_ret, bge_reranker, doc_map
+    # BM25
+    try:
+        bm25 = BM25Retriever()
+        bm25.load_index(config.BM25_INDEX_PATH)
+        retrievers["BM25"] = bm25
+    except Exception as e:
+        print(f"BM25 init failed: {e}")
+
+    # BGE Dense
+    try:
+        bge = BGERetriever(api_key=config.SF_API_KEY)
+        bge.load_index(config.BGE_INDEX_DIR)
+        retrievers["BGE"] = bge
+    except Exception as e:
+        print(f"BGE init failed: {e}")
+
+    # Model2Vec
+    try:
+        # Assuming model name/path is configured in config for Model2Vec
+        m2v = Model2VecRetriever(model_name=config.MODEL2VEC_MODEL_NAME)
+        m2v.load_index(config.MODEL2VEC_INDEX_PATH)
+        retrievers["Model2Vec"] = m2v
+    except Exception as e:
+        print(f"Model2Vec init failed: {e}")
+
+    # Qwen3
+    try:
+        qwen = Qwen3Retriever(api_key=config.SF_API_KEY)
+        qwen.load_index(config.QWEN_INDEX_DIR)
+        retrievers["Qwen3"] = qwen
+    except Exception as e:
+        print(f"Qwen3 init failed: {e}")
+
+    # MultiVector
+    try:
+        multi = MultiVectorRetriever(chunk_size=100, chunk_overlap=20, api_key=config.SF_API_KEY)
+        multi.load_index(config.MULTI_VECTOR_INDEX_DIR)
+        retrievers["MultiVector"] = multi
+    except Exception as e:
+        print(f"MultiVector init failed: {e}")
+
+    return retrievers, bge_reranker, doc_map
 
 
 # ==========================================
-# 主流程（完全静默执行 + 结果精准展示）
+# Main Pipeline
 # ==========================================
-def rag_pipeline(query):
-    # ====================== 主流程追踪栏 ======================
-    st.markdown(f"### 原始问题：**{query}**")
+def rag_pipeline(query, retriever_config):
+    # ====================== Main Process Tracker ======================
+    st.markdown(f"### Original Question: **{query}**")
 
-    # 用 st.tabs 做顶级导航 + 进度条
-    tab_decomp, tab_process, tab_final = st.tabs(["1. 查询分解", "2. 子问题逐个处理", "3. 最终答案合成"])
+    # Get Resources
+    retrievers_map, bge_reranker, doc_map = get_resources()
 
-    bm25, bge_ret, bge_rerank, doc_map = get_retrievers()
+    # Parse Current Configuration
+    mode = retriever_config["mode"]
+    selected_instances = []
+
+    if mode == "single":
+        r_name = retriever_config["selected"][0]
+        selected_instances = [retrievers_map[r_name]]
+        st.info(f"Current Mode: **Single Retrieval** | Using Retriever: `{r_name}`")
+    else:
+        r_name1 = retriever_config["selected"][0]
+        r_name2 = retriever_config["selected"][1]
+        selected_instances = [retrievers_map[r_name1], retrievers_map[r_name2]]
+        st.info(f"Current Mode: **Hybrid Retrieval (Hybrid + Rerank)** | Combination: `{r_name1}` + `{r_name2}`")
+
+    # Top-level navigation + Progress via st.tabs
+    tab_decomp, tab_process, tab_final = st.tabs(["1. Query Decomposition", "2. Sub-query Processing", "3. Final Synthesis"])
+
     answers_dict = {}
     processed_subs = []
 
-    # ====================== Tab 1: 查询分解 ======================
+    # ====================== Tab 1: Query Decomposition ======================
     with tab_decomp:
-        st.write("**原始问题**")
+        st.write("**Original Question**")
         st.info(query)
 
-        with st.spinner("正在进行查询分解..."):
+        with st.spinner("Decomposing query..."):
             resp = call_llm(DECOMPOSITION_PROMPT.format(query=query), expect_json=True)
 
         needs_decomp = resp.get("needs_decomposition", False)
@@ -107,23 +167,23 @@ def rag_pipeline(query):
                     sub_queries.append(item)
                 else:
                     sub_queries.append({"id": f"q{i + 1}", "query": str(item), "depends_on": []})
-            st.success(f"成功分解为 **{len(sub_queries)} 个子问题**（支持依赖关系）")
+            st.success(f"Successfully decomposed into **{len(sub_queries)} sub-queries** (dependencies supported)")
         else:
             sub_queries = [{"id": "q1", "query": query, "depends_on": []}]
-            st.info("无需分解，直接作为单一问题处理")
+            st.info("No decomposition needed; processing as a single query.")
 
-        # 美观展示分解结果（关键表格）
+        # Display decomposition results nicely
         rows = []
         for sq in sub_queries:
-            deps = " → ".join(sq.get("depends_on", [])) if sq.get("depends_on") else "无"
+            deps = " → ".join(sq.get("depends_on", [])) if sq.get("depends_on") else "None"
             rows.append({
-                "子问题ID": sq['id'],
-                "子问题内容": sq['query'],
-                "依赖": deps
+                "Sub-query ID": sq['id'],
+                "Content": sq['query'],
+                "Dependencies": deps
             })
         st.table(rows)
 
-    # ====================== Tab 2: 子问题逐个处理 ======================
+    # ====================== Tab 2: Sub-query Processing ======================
     with tab_process:
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -131,28 +191,27 @@ def rag_pipeline(query):
         for idx, sq in enumerate(sub_queries):
             sq_id = sq["id"]
             progress_bar.progress((idx + 1) / len(sub_queries))
-            status_text.text(f"正在处理：{sq_id} - {sq['query'][:60]}...")
+            status_text.text(f"Processing: {sq_id} - {sq['query'][:60]}...")
 
-            # 每个子问题用独立的 expander（默认展开前3个）
-            with st.expander(f"子问题 {sq_id}：{sq['query']}", expanded=(idx < 3)):
+            with st.expander(f"Sub-query {sq_id}: {sq['query']}", expanded=(idx < 3)):
                 col1, col2 = st.columns([3, 1])
                 with col1:
-                    st.markdown(f"**原始子问题**")
+                    st.markdown(f"**Original Sub-query**")
                     st.code(sq['query'], language=None)
                 with col2:
                     deps = sq.get("depends_on", [])
                     if deps:
                         prev = {d: answers_dict[d]["answer"] for d in deps if d in answers_dict}
-                        st.markdown("**已注入依赖答案**")
+                        st.markdown("**Injected Dependency Answers**")
                         for k, v in prev.items():
                             st.caption(f"**{k}**: {v[:100]}...")
                     else:
-                        st.success("无依赖")
+                        st.success("No dependencies")
 
-                # === 子查询重写 ===
+                # === Sub-query Rewriting ===
                 current_q = sq["query"]
                 if sq.get("depends_on"):
-                    with st.spinner("根据依赖重写查询..."):
+                    with st.spinner("Rewriting query based on dependencies..."):
                         rewrite_resp = call_llm(
                             REWRITE_SUBQUERIES_PROMPT.format(
                                 original_query=query,
@@ -168,93 +227,123 @@ def rag_pipeline(query):
                         rewritten = rewrite_resp.get("rewritten_queries", [])
                         if rewritten:
                             current_q = rewritten[0]["rewritten_query"]
-                            st.markdown("**重写后查询**")
+                            st.markdown("**Rewritten Query**")
                             st.success(current_q)
 
                 final_q = current_q
 
-                # === 迭代检索（最多3轮）===
+                # === Iterative Retrieval ===
                 best_docs = None
                 best_ids = None
                 best_scores = None
                 relevant = False
 
                 for attempt in range(1, 4):
-                    st.markdown(f"#### 第 {attempt} 次检索（查询：`{final_q}`）")
+                    st.markdown(f"#### Retrieval Attempt #{attempt} (Query: `{final_q}`)")
 
-                    with st.spinner(f"混合检索 + 重排序中..."):
-                        results = hybrid_retrieve_and_rerank(
-                            query=final_q,
-                            first_retriever=bm25,
-                            second_retriever=bge_ret,
-                            reranker=bge_rerank,
-                            doc_id_to_text_map=doc_map,
-                            retrieval_top_k=50,
-                            rerank_top_k=15
-                        )
-                        filtered = [(did, score) for did, score in results if score >= 50]
-                        if not filtered and results:
-                            filtered = results[:5]  # 兜底取最高5篇
+                    with st.spinner(f"Retrieving..."):
+                        results = []
 
-                        best_ids, best_scores = zip(*filtered)
-                        best_docs = [doc_map[did] for did in best_ids]
+                        # >>>>>> Core Retrieval Dispatch Logic <<<<<<
+                        if mode == "hybrid":
+                            # Hybrid Retrieval: Must use Reranker
+                            results = hybrid_retrieve_and_rerank(
+                                query=final_q,
+                                first_retriever=selected_instances[0],
+                                second_retriever=selected_instances[1],
+                                reranker=bge_reranker,
+                                doc_id_to_text_map=doc_map,
+                                retrieval_top_k=50,
+                                rerank_top_k=15
+                            )
+                            # In hybrid mode, scores are usually normalized, use threshold filtering
+                            filtered = [(did, score) for did, score in results if score >= 50]
+                            if not filtered and results:
+                                filtered = results[:5]  # Fallback
+                        else:
+                            # Single Retrieval: Direct call to .query()
+                            retriever = selected_instances[0]
+                            # Get Top 15
+                            raw_results = retriever.query(final_q, top_k=15)
+                            results = raw_results
+                            # Single retrieval scores are not normalized, threshold not applicable, take all Top K
+                            filtered = results
 
-                    # 高亮展示检索结果
-                    score_cols = st.columns(len(filtered[:5]))
-                    for i, (doc_id, score) in enumerate(zip(best_ids[:5], best_scores[:5])):
-                        with score_cols[i]:
-                            if score >= 70:
-                                st.metric(f"Doc {i + 1}", f"{score:.1f}", delta="高相关")
-                            elif score >= 60:
-                                st.metric(f"Doc {i + 1}", f"{score:.1f}", delta="中等")
-                            else:
-                                st.metric(f"Doc {i + 1}", f"{score:.1f}", delta="低相关")
+                        # Unpack results
+                        if filtered:
+                            best_ids, best_scores = zip(*filtered)
+                            best_docs = [doc_map[did] for did in best_ids]
+                        else:
+                            best_ids, best_scores, best_docs = [], [], []
 
-                    with st.expander(f"查看全部 {len(filtered)} 篇高分文档内容", expanded=False):
+                    # Highlight Retrieval Results
+                    if best_scores:
+                        display_count = min(5, len(best_scores))
+                        score_cols = st.columns(display_count)
+                        for i in range(display_count):
+                            score = best_scores[i]
+                            with score_cols[i]:
+                                # Only Hybrid (with Reranker) is suitable for color grading
+                                if mode == "hybrid":
+                                    if score >= 70:
+                                        st.metric(f"Doc {i + 1}", f"{score:.1f}", delta="High Relevance")
+                                    elif score >= 60:
+                                        st.metric(f"Doc {i + 1}", f"{score:.1f}", delta="Medium")
+                                    else:
+                                        st.metric(f"Doc {i + 1}", f"{score:.1f}", delta="Low Relevance")
+                                else:
+                                    # Single retrieval shows raw scores
+                                    st.metric(f"Doc {i + 1}", f"{score:.4f}", delta="Raw Score")
+
+                    with st.expander(f"View Top {len(best_docs)} Document Contents", expanded=False):
                         for i, (doc_id, text, score) in enumerate(zip(best_ids, best_docs, best_scores)):
-                            st.markdown(f"**Doc {i + 1}** | ID: `{doc_id}` | **Rerank 分数: {score:.2f}**")
-                            st.caption(text[:1000] + ("..." if len(text) > 1000 else ""))
+                            st.markdown(f"**Doc {i + 1}** | ID: `{doc_id}` | **Score: {score:.4f}**")
+                            st.caption(text[:800] + ("..." if len(text) > 800 else ""))
                             st.divider()
 
-                    # 相关性判断
-                    ctx_preview = "\n\n".join([f"Doc {i + 1}: {d[:500]}..." for i, d in enumerate(best_docs[:5])])
-                    rel_resp = call_llm(
-                        RELEVANCE_AND_REWRITE_PROMPT.format(
-                            query=final_q,
-                            context_dependency="\n".join(
-                                [answers_dict[d]["answer"] for d in sq.get("depends_on", []) if d in answers_dict]),
-                            documents=ctx_preview
-                        ),
-                        expect_json=True
-                    )
-                    relevant = rel_resp.get("is_relevant", False)
-                    reason = rel_resp.get("reason", "无")
+                    # Relevance Check (LLM Check)
+                    if not best_docs:
+                        st.warning("No documents retrieved.")
+                        relevant = False
+                    else:
+                        ctx_preview = "\n\n".join([f"Doc {i + 1}: {d[:500]}..." for i, d in enumerate(best_docs[:5])])
+                        rel_resp = call_llm(
+                            RELEVANCE_AND_REWRITE_PROMPT.format(
+                                query=final_q,
+                                context_dependency="\n".join(
+                                    [answers_dict[d]["answer"] for d in sq.get("depends_on", []) if d in answers_dict]),
+                                documents=ctx_preview
+                            ),
+                            expect_json=True
+                        )
+                        relevant = rel_resp.get("is_relevant", False)
+                        reason = rel_resp.get("reason", "None")
 
                     if relevant:
-                        st.success(f"第 {attempt} 次检索成功！文档足够相关")
+                        st.success(f"Attempt #{attempt} successful! Documents are relevant.")
                         break
                     else:
-                        st.warning(f"第 {attempt} 次不相关：{reason}")
-                        new_q = rel_resp.get("improved_query", "").strip()
+                        st.warning(f"Attempt #{attempt} irrelevant: {reason}")
+                        new_q = rel_resp.get("improved_query", "").strip() if 'rel_resp' in locals() else ""
                         if new_q and attempt < 3:
                             final_q = new_q
-                            st.info(f"→ 采用改进查询继续：{new_q}")
+                            st.info(f"→ Continuing with improved query: {new_q}")
                         else:
-                            st.info("不再改进，已达最大轮次")
+                            st.info("No further improvements; max attempts reached.")
 
-                # 兜底
-                if not relevant:
-                    st.error("多次检索仍未达标，使用最高分文档强制生成")
-                    top10 = results[:10]
-                    best_ids = [x[0] for x in top10]
-                    best_scores = [x[1] for x in top10]
+                # Fallback
+                if not best_docs and results:
+                    st.error("Multiple attempts failed to meet criteria; forcing use of last results.")
+                    top5 = results[:5]
+                    best_ids = [x[0] for x in top5]
                     best_docs = [doc_map[did] for did in best_ids]
 
-                # === 答案生成 + 自检 ===
-                with st.spinner("生成答案 + 自检..."):
-                    context = "\n\n".join(best_docs)
+                # === Answer Generation + Self-Check ===
+                with st.spinner("Generating Answer + Self-Checking..."):
+                    context = "\n\n".join(best_docs) if best_docs else "Unable to retrieve relevant information."
                     prev_ctx = "\n".join(
                         [f"{k}: {v}" for k, v in answers_dict.items() if k in sq.get("depends_on", [])])
+
                     answer = call_llm(GENERATE_ANSWER_PROMPT.format(
                         query=final_q,
                         previous_answers=prev_ctx,
@@ -264,10 +353,10 @@ def rag_pipeline(query):
                     check = call_llm(SELF_CHECK_PROMPT.format(query=final_q, answer=answer, documents=context),
                                      expect_json=True)
                     if not check.get("is_valid", True):
-                        st.warning("自检发现问题 → 自动修正")
+                        st.warning("Self-check found issues → Automatically revising")
                         answer = check.get("revised_answer", answer)
 
-                st.markdown("**最终答案**")
+                st.markdown("**Final Answer**")
                 st.success(answer)
 
                 answers_dict[sq_id] = {"answer": answer, "final_query": final_q}
@@ -276,11 +365,11 @@ def rag_pipeline(query):
         progress_bar.empty()
         status_text.empty()
 
-    # ====================== Tab 3: 最终答案合成 ======================
+    # ====================== Tab 3: Final Synthesis ======================
     with tab_final:
-        st.markdown("### 最终答案")
+        st.markdown("### Final Answer")
         if len(processed_subs) > 1:
-            with st.spinner("多子答案合成中..."):
+            with st.spinner("Synthesizing multiple sub-answers..."):
                 synth_text = "\n\n".join([
                     f"【{s['id']}】 {s['query']}\n→ {s['answer']}"
                     for s in processed_subs
@@ -291,45 +380,84 @@ def rag_pipeline(query):
                         sub_answers_with_dependencies=synth_text
                     )
                 )
-            st.success("多答案合成完成")
+            st.success("Multi-answer synthesis complete.")
         else:
-            final_answer = processed_subs[0]["answer"] if processed_subs else "无法生成答案"
+            final_answer = processed_subs[0]["answer"] if processed_subs else "Unable to generate answer."
 
-        # 大字体高亮最终输出
         st.markdown(f"<h2 style='text-align: center; color: #1E90FF;'>{final_answer}</h2>", unsafe_allow_html=True)
-
-        # 可复制文本框
-        st.text_area("复制最终答案", final_answer, height=200)
+        st.text_area("Copy Final Answer", final_answer, height=200)
 
         return final_answer
 
 
 # ==========================================
-# Streamlit 界面
+# Streamlit Interface
 # ==========================================
-st.set_page_config(page_title="高级 RAG 系统（极简专业版）", layout="centered")
-st.title("高级 RAG 系统")
+st.set_page_config(page_title="NLP GROUP WORK", layout="centered")
+st.title("NLP GROUP WORK")
 st.markdown("""
-**特性**：多跳依赖分解 → 子查询重写 → 迭代检索（完整文档展示）→ 自检 → 答案合成  
-**界面特点**：无冗余提示、结果清晰、适合演示与调试
+**Features**: Multi-hop Decomposition → Sub-query Rewriting → Flexible Retrieval Config → Iterative Optimization → Self-Check
 """)
 
+# Get loaded retrievers list
+retrievers_map, _, _ = get_resources()
+available_retrievers = list(retrievers_map.keys())
+
 with st.sidebar:
-    st.header("系统信息")
+    st.header("System Info")
     st.write(f"LLM: `{config.SF_LLM_MODEL_NAME}`")
-    st.write(f"知识库: `{config.COLLECTION_PATH}`")
-    if st.button("清空缓存"):
+    st.write(f"Knowledge Base: `{config.COLLECTION_PATH}`")
+
+    st.divider()
+    st.header("Retrieval Strategy Configuration")
+
+    # Retrieval Mode Selection
+    retrieve_mode = st.radio(
+        "Select Retrieval Mode",
+        ("Single Retrieval", "Hybrid Retrieval (Hybrid + Rerank)"),
+        index=0
+    )
+
+    selected_retrievers = []
+
+    if retrieve_mode == "Single Retrieval":
+        # Single selection dropdown
+        choice = st.selectbox("Select Retriever", available_retrievers, index=0)
+        selected_retrievers = [choice]
+        st.caption("In single mode, raw scores from the retriever are used without re-ranking.")
+
+    else:
+        # Hybrid Retrieval Configuration
+        st.markdown("**Select two different retrievers for hybrid mode:**")
+        col1, col2 = st.columns(2)
+        with col1:
+            r1 = st.selectbox("Retriever A", available_retrievers, index=0, key="r1")
+        with col2:
+            # Default to second option if available
+            default_idx = 1 if len(available_retrievers) > 1 else 0
+            r2 = st.selectbox("Retriever B", available_retrievers, index=default_idx, key="r2")
+
+        selected_retrievers = [r1, r2]
+        st.caption("Hybrid mode merges results from both and uses **BGE Reranker** for re-ranking.")
+
+    st.divider()
+    if st.button("Clear Cache"):
         st.cache_resource.clear()
-        st.success("缓存已清空")
+        st.success("Cache cleared. Please refresh the page.")
 
 query = st.text_input(
-    "请输入问题",
-    placeholder="例如：Austrolebias bellotti 所在的河流是朝哪个方向流的？",
-    value="What direction does the river that Austrolebias bellotti are found in flow?"
+    "Enter your question",
+    placeholder="E.g.: The second place finisher of the 2011 Gran Premio Santander d'Italia drove for who when he won the 2009 FIA Formula One World Championship?",
+    value="The second place finisher of the 2011 Gran Premio Santander d'Italia drove for who when he won the 2009 FIA Formula One World Championship?"
 )
 
-if st.button("开始推理", type="primary", use_container_width=True):
+if st.button("Start Reasoning", type="primary", use_container_width=True):
     if query.strip():
-        rag_pipeline(query)
+        # Build config object to pass to pipeline
+        config_obj = {
+            "mode": "single" if retrieve_mode == "Single Retrieval" else "hybrid",
+            "selected": selected_retrievers
+        }
+        rag_pipeline(query, config_obj)
     else:
-        st.warning("请输入问题")
+        st.warning("Please enter a question.")
