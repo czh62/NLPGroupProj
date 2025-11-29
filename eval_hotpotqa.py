@@ -10,7 +10,7 @@ from collections import Counter
 
 def read_jsonl(file_path):
     data = list()
-    with open(file_path, 'r') as f:
+    with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
             data.append(json.loads(line))
     print(f'[{time.asctime()}] Read {len(data)} from {file_path}')
@@ -146,8 +146,8 @@ def eval(predictions, gold_data, topk=5):
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate Hotpot QA results.')
-    parser.add_argument('--gold', '-g', type=str, required=True, help='Path to the gold file.')
-    parser.add_argument('--pred', '-p', type=str, required=True, help='Path to the predicted file.')
+    parser.add_argument('--gold', '-g', type=str, default="COMP5423-25Fall-HQ-small/validation.jsonl", help='Path to the gold file.')
+    parser.add_argument('--pred', '-p', type=str, default="data/hybrid_retrieve_prediction.jsonl", help='Path to the predicted file.')
     parser.add_argument('--topk', '-k', type=int, default=5, help='Top k docs in eval.')
     args = parser.parse_args()
     gold_data = read_jsonl(args.gold)

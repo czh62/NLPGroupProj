@@ -87,6 +87,12 @@ Requirements:
 2. Answer must be concise, direct, complete, and logically coherent
 3. Output the answer content directly, without any prefix
 
+Examples of desired output style:
+Q: “Where was Barack Obama born?” → Hawaii, USA.
+Q: “Where was Michelle Obama born?” → Chicago, Illinois, USA.
+Q: “Who wrote 1984?” → George Orwell.
+Q: “What is the capital of France?” → Paris.
+
 User question: {query}
 Previous answer context (answers to resolved dependency questions): {previous_answers}
 Current retrieval context (reliable information retrieved this time): {context}
@@ -111,7 +117,7 @@ Output strictly in the following JSON format (JSON only):
 """.strip()
 
 SYNTHESIZE_ANSWERS_PROMPT = """
-You are an answer synthesis expert. Your task is to give a concise, natural final answer to the original user question using the provided sub-answers as hidden reference only.
+You are an answer synthesis expert. Your task is to give an extremely concise, natural final answer to the original user question using the provided sub-answers as hidden reference only.
 
 Original question: {original_query}
 
@@ -119,13 +125,20 @@ Reference sub-answers (do NOT mention them or quote them directly):
 {sub_answers_with_dependencies}
 
 CRITICAL RULES — follow exactly:
-- Answer the original question directly in 1–4 sentences (preferably 1–2).
-- Do NOT explain reasoning process.
-- Do NOT mention “sub-questions”, “first”, “second”, “according to source X”.
-- Do NOT repeat the question.
-- Do NOT add meta-commentary like “Based on the analysis…”.
-- Remove all redundancy and tracing of intermediate steps.
-- If the answer naturally fits in one short paragraph, use only that.
+- Answer in the shortest possible form that is still complete and natural (aim for 1–8 words when possible, like real-world quick facts).
+- Prefer direct noun-phrase answers (e.g., “Hawaii, USA.” instead of full sentences).
+- Use a full sentence only when absolutely necessary for clarity.
+- Never use more than one sentence.
+- Do NOT explain, justify, or add any context.
+- Do NOT say “According to…”, “Sources indicate…”, or any meta phrasing.
+- Do NOT repeat the question or any part of it.
+- No markdown, no quotes, no bullets, no JSON, no titles.
 
-Output the final answer ONLY — no JSON, no titles, no markdown, nothing else.
+Examples of desired output style:
+Q: “Where was Barack Obama born?” → Hawaii, USA.
+Q: “Where was Michelle Obama born?” → Chicago, Illinois, USA.
+Q: “Who wrote 1984?” → George Orwell.
+Q: “What is the capital of France?” → Paris.
+
+Output the final answer ONLY — nothing else.
 """.strip()

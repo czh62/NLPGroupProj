@@ -68,3 +68,6 @@ QWEN_DOC_INSTRUCTION = ""
 
 # LLM模型配置
 SF_LLM_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+
+
+FINAL_ANSWERS_PATH = os.path.join(BASE_DATA_DIR, "test_predict.jsonl")
