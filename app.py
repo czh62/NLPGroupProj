@@ -393,8 +393,8 @@ def rag_pipeline(query, retriever_config):
 # ==========================================
 # Streamlit Interface
 # ==========================================
-st.set_page_config(page_title="NLP GROUP WORK", layout="centered")
-st.title("NLP GROUP WORK")
+st.set_page_config(page_title="NLP GROUP 6 WORK", layout="centered")
+st.title("NLP GROUP 6 WORK")
 st.markdown("""
 **Features**: Multi-hop Decomposition → Sub-query Rewriting → Flexible Retrieval Config → Iterative Optimization → Self-Check
 """)
